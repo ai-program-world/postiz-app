@@ -8,6 +8,7 @@ import {
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { TemporalService } from 'nestjs-temporal-core';
 import { timer } from '@gitroom/helpers/utils/timer';
+import { safeStringify } from '@gitroom/nestjs-libraries/integrations/social.abstract';
 
 @Injectable()
 export class RefreshIntegrationService {
@@ -74,7 +75,7 @@ export class RefreshIntegrationService {
     socialProvider: SocialProvider,
     cause = ''
   ): Promise<AuthTokenDetails | false> {
-    let refreshError: any = undefined;
+    let refreshError: any = null;
     const refresh: false | AuthTokenDetails = await socialProvider
       .refreshToken(integration.refreshToken)
       .catch((err) => {
@@ -127,12 +128,22 @@ export class RefreshIntegrationService {
       }
 
       console.error(
-        `Could not refresh ${integration.providerIdentifier} integration ${integration.id}`,
-        refreshError?.response?.data ||
-          refreshError?.message ||
-          refreshError ||
-          'no access token returned'
+        `Refresh failed for ${integration.providerIdentifier} (${integration.id}):`,
+        refreshError || 'no access token returned'
       );
+
+      if (refreshError) {
+        const handle = socialProvider.handleErrors?.(
+          `${refreshError?.message || ''} ${safeStringify(refreshError)}`,
+          refreshError?.status || refreshError?.response?.status || 0
+        );
+
+        // transient / unrecognized errors should not disconnect the channel,
+        // only errors the provider recognizes as an invalid refresh token
+        if (handle?.type !== 'refresh-token') {
+          return false;
+        }
+      }
 
       // informAboutRefreshError (with the failure cause) already notifies
       // the user, and refreshNeeded sets the same flag disconnectChannel
