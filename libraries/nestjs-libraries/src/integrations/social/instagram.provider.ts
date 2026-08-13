@@ -836,6 +836,18 @@ export class InstagramProvider
         const itemCollaborators =
           firstPost?.media?.length === 1 ? collaborators : ``;
 
+        // share_to_feed is only supported for Reels (single video, not a story),
+        // and only sent when the user explicitly turned it off (Meta defaults to true)
+        const shareToFeed =
+          typeof firstPost?.settings?.share_to_feed !== 'undefined' &&
+          firstPost?.settings?.share_to_feed !== null &&
+          !this.assetBoolean(firstPost.settings.share_to_feed) &&
+          !isStory &&
+          firstPost?.media?.length === 1 &&
+          hasExtension(m.path, 'mp4')
+            ? `&share_to_feed=false`
+            : ``;
+
         // audio_configuration is only supported for Reels (single video, not a story)
         // and only with Facebook Login (not Instagram Login / graph.instagram.com)
         const audioConfiguration =
@@ -861,7 +873,7 @@ export class InstagramProvider
 
         const { id: photoId } = await (
           await this.fetch(
-            `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?${mediaType}${altText}${isCarousel}${itemCollaborators}${trialParams}${audioConfiguration}&access_token=${accessToken}${caption}`,
+            `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?${mediaType}${altText}${isCarousel}${itemCollaborators}${trialParams}${audioConfiguration}${shareToFeed}&access_token=${accessToken}${caption}`,
             {
               method: 'POST',
             }
