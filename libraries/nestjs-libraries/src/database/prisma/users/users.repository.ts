@@ -9,6 +9,7 @@ import { AuthService } from '@gitroom/helpers/auth/auth.service';
 import { UserDetailDto } from '@gitroom/nestjs-libraries/dtos/users/user.details.dto';
 import { EmailNotificationsDto } from '@gitroom/nestjs-libraries/dtos/users/email-notifications.dto';
 import { TimezoneDto } from '@gitroom/nestjs-libraries/dtos/users/timezone.dto';
+import { MediaSettingsDto } from '@gitroom/nestjs-libraries/dtos/users/media-settings.dto';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 
 @Injectable()
@@ -311,6 +312,28 @@ export class UsersRepository {
       },
       select: {
         id: true,
+      },
+    });
+  }
+
+  async getMediaSettings(userId: string) {
+    return this._user.model.user.findUnique({
+      where: {
+        id: userId,
+      },
+      select: {
+        skipMediaRescale: true,
+      },
+    });
+  }
+
+  async updateMediaSettings(userId: string, body: MediaSettingsDto) {
+    await this._user.model.user.update({
+      where: {
+        id: userId,
+      },
+      data: {
+        skipMediaRescale: body.skipMediaRescale,
       },
     });
   }

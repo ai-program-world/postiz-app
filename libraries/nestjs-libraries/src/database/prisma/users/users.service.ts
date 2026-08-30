@@ -4,6 +4,7 @@ import { Provider, Role } from '@prisma/client';
 import { UserDetailDto } from '@gitroom/nestjs-libraries/dtos/users/user.details.dto';
 import { EmailNotificationsDto } from '@gitroom/nestjs-libraries/dtos/users/email-notifications.dto';
 import { TimezoneDto } from '@gitroom/nestjs-libraries/dtos/users/timezone.dto';
+import { MediaSettingsDto } from '@gitroom/nestjs-libraries/dtos/users/media-settings.dto';
 import { OrganizationRepository } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.repository';
 import { IntegrationRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.repository';
 import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
@@ -178,5 +179,13 @@ export class UsersService {
 
   updateTimezone(userId: string, body: TimezoneDto) {
     return this._usersRepository.updateTimezone(userId, body);
+  }
+
+  getMediaSettings(userId: string) {
+    return this._usersRepository.getMediaSettings(userId);
+  }
+
+  updateMediaSettings(userId: string, body: MediaSettingsDto) {
+    return this._usersRepository.updateMediaSettings(userId, body);
   }
 }

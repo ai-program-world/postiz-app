@@ -15,6 +15,7 @@ import Compressor from '@uppy/compressor';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { useToaster } from '@gitroom/react/toaster/toaster';
 import { useLaunchStore } from '@gitroom/frontend/components/new-launch/store';
+import { useMediaSettings } from '@gitroom/frontend/components/settings/media-settings.component';
 import { uniqBy } from 'lodash';
 
 export class CompressionWrapper<M = any, B = any> extends Compressor<any, any> {
@@ -57,7 +58,13 @@ export function useUppyUploader(props: {
   } = useVariables();
   const { onUploadSuccess, allowedFileTypes } = props;
   const fetch = useFetch();
+  const { data: mediaSettings } = useMediaSettings();
+  const skipMediaRescale = !!mediaSettings?.skipMediaRescale;
   return useMemo(() => {
+    // The normalizer takes precedence over Transloadit, so both can stay
+    // configured and turning the normalizer off falls back to Transloadit
+    const useTransloadit =
+      !mediaProcessing && transloadit.length > 0 && !skipMediaRescale;
     // Track file order to maintain original sequence after upload
     let fileOrderIndex = 0;
 
@@ -94,10 +101,10 @@ export function useUppyUploader(props: {
             return ['video/mp4', 'video/mpeg', 'video/quicktime'];
           }
           // the normalizer turns QuickTime into mp4, nothing else is accepted by the bucket
-          if (type === 'video/mp4' && mediaProcessing) {
+          if (type === 'video/mp4' && mediaProcessing && !skipMediaRescale) {
             return ['video/mp4', 'video/quicktime'];
           }
-          if (type === 'video/mp4' && transloadit && transloadit.length > 0) {
+          if (type === 'video/mp4' && useTransloadit) {
             return ['video/mp4', 'video/mpeg', 'video/quicktime'];
           }
           return [type];
@@ -180,9 +187,6 @@ export function useUppyUploader(props: {
       });
     });
 
-    // The normalizer takes precedence over Transloadit, so both can stay
-    // configured and turning the normalizer off falls back to Transloadit
-    const useTransloadit = !mediaProcessing && transloadit.length > 0;
     const { plugin, options } = getUppyUploadPlugin(
       useTransloadit ? 'transloadit' : storageProvider,
       fetch,
@@ -204,7 +208,7 @@ export function useUppyUploader(props: {
       });
     }
     // the normalizer resizes on the server, shrinking first would only make it upscale a blurry copy
-    if (!disableImageCompression && !mediaProcessing) {
+    if (!disableImageCompression && !mediaProcessing && !skipMediaRescale) {
       uppy2.use(CompressionWrapper, {
         convertTypes: ['image/jpeg', 'image/png', 'image/webp'],
         maxWidth: 1000,
@@ -327,5 +331,5 @@ export function useUppyUploader(props: {
       });
     });
     return uppy2;
-  }, []);
+  }, [skipMediaRescale]);
 }

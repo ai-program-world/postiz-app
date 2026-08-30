@@ -26,6 +26,7 @@ import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/us
 import { UserDetailDto } from '@gitroom/nestjs-libraries/dtos/users/user.details.dto';
 import { EmailNotificationsDto } from '@gitroom/nestjs-libraries/dtos/users/email-notifications.dto';
 import { TimezoneDto } from '@gitroom/nestjs-libraries/dtos/users/timezone.dto';
+import { MediaSettingsDto } from '@gitroom/nestjs-libraries/dtos/users/media-settings.dto';
 import { HttpForbiddenException } from '@gitroom/nestjs-libraries/services/exception.filter';
 import { RealIP } from 'nestjs-real-ip';
 import { UserAgent } from '@gitroom/nestjs-libraries/user/user.agent';
@@ -240,6 +241,19 @@ export class UsersController {
     @Body() body: TimezoneDto
   ) {
     return this._userService.updateTimezone(user.id, body);
+  }
+
+  @Get('/media-settings')
+  async getMediaSettings(@GetUserFromRequest() user: User) {
+    return this._userService.getMediaSettings(user.id);
+  }
+
+  @Post('/media-settings')
+  async updateMediaSettings(
+    @GetUserFromRequest() user: User,
+    @Body() body: MediaSettingsDto
+  ) {
+    return this._userService.updateMediaSettings(user.id, body);
   }
 
   @Post('/api-key/rotate')
