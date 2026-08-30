@@ -60,7 +60,7 @@ export function useUppyUploader(props: {
   const fetch = useFetch();
   const { data: mediaSettings } = useMediaSettings();
   const skipMediaRescale = !!mediaSettings?.skipMediaRescale;
-  return useMemo(() => {
+  const uppy = useMemo(() => {
     // The normalizer takes precedence over Transloadit, so both can stay
     // configured and turning the normalizer off falls back to Transloadit
     const useTransloadit =
@@ -332,4 +332,8 @@ export function useUppyUploader(props: {
     });
     return uppy2;
   }, [skipMediaRescale]);
+
+  useEffect(() => () => uppy.destroy(), [uppy]);
+
+  return uppy;
 }
