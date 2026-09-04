@@ -160,9 +160,15 @@ export class MediaService {
       response.body,
       declaredSize
     );
+    const originalName = new URL(url).pathname.split('/').pop() || undefined;
     return adjust
-      ? this.saveUploadedFile(org, uploaded.originalname, uploaded.path)
-      : this.saveFile(org, uploaded.originalname, uploaded.path);
+      ? this.saveUploadedFile(
+          org,
+          uploaded.originalname,
+          uploaded.path,
+          originalName
+        )
+      : this.saveFile(org, uploaded.originalname, uploaded.path, originalName);
   }
 
   saveFile(

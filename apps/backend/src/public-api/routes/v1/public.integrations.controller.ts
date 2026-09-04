@@ -93,11 +93,17 @@ export class PublicIntegrationsController {
       return this._mediaService.saveUploadedFile(
         org.id,
         file.filename,
-        file.path
+        file.path,
+        file.originalname
       );
     }
 
-    return this._mediaService.saveFile(org.id, file.filename, file.path);
+    return this._mediaService.saveFile(
+      org.id,
+      file.filename,
+      file.path,
+      file.originalname
+    );
   }
 
   @Post('/upload-from-url')
