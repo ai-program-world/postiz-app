@@ -185,7 +185,7 @@ export interface SocialProvider
     body: string,
     status: number
   ):
-    | { type: 'refresh-token' | 'bad-body' | 'retry'; value: string }
+    | { type: 'refresh-token' | 'bad-body' | 'retry' | 'disconnect'; value: string }
     | undefined;
   convertToJPEG?: boolean;
   stripLinks?: () => boolean;
