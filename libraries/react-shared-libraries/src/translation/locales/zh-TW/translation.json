@@ -946,6 +946,8 @@
   "metric_retweets": "轉發數",
   "metric_reactions": "心情互動",
   "metric_clicks": "點擊次數",
+  "metric_link_clicks": "連結點擊次數",
+  "metric_clicks_by_link": "各連結點擊次數",
   "metric_outbound_clicks": "外部連結點擊",
   "metric_pin_clicks": "釘圖點擊",
   "metric_pin_click_rate": "釘圖點擊率",

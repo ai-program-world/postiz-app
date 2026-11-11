@@ -834,17 +834,30 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
             viewsPoints: [],
             totals: {} as Record<string, number>,
           }),
-      safeAnalyticsCall<number | undefined>(
+      safeAnalyticsCall<
+        { sum: number; byLink: Record<string, number> } | undefined
+      >(
         'threads.clicks',
         async () => {
           let sum = 0;
           let found = false;
+          const byLink: Record<string, number> = {};
           for (const w of windows) {
             const res = await this.fetchThreadsJson(
               `https://graph.threads.net/v1.0/${id}/threads_insights?metric=clicks&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
             );
             const d = res?.data?.[0];
-            if (d?.total_value?.value !== undefined) {
+            if (Array.isArray(d?.link_total_values)) {
+              // `clicks` is a "Link Total Values" metric: one entry per shared URL
+              for (const l of d.link_total_values) {
+                const v = Number(l?.value) || 0;
+                sum += v;
+                if (l?.link_url) {
+                  byLink[l.link_url] = (byLink[l.link_url] || 0) + v;
+                }
+              }
+              found = true;
+            } else if (d?.total_value?.value !== undefined) {
               sum += Number(d.total_value.value) || 0;
               found = true;
             } else if (Array.isArray(d?.values)) {
@@ -852,7 +865,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
               found = true;
             }
           }
-          return found ? sum : undefined;
+          return found ? { sum, byLink } : undefined;
         },
         undefined
       ),
@@ -911,13 +924,23 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
 
     if (clicksTotal !== undefined) {
       result.push({
-        label: 'Clicks',
+        label: 'Link Clicks',
         percentageChange: 0,
         aggregation: 'sum',
         unit: 'number',
         category: 'traffic',
-        data: [{ total: String(clicksTotal), date: today }],
+        data: [{ total: String(clicksTotal.sum), date: today }],
       });
+      const linksBd = buildBreakdown(clicksTotal.byLink, 10);
+      if (linksBd.length > 0) {
+        result.push({
+          label: 'Clicks by Link',
+          percentageChange: 0,
+          category: 'traffic',
+          breakdown: linksBd,
+          data: [{ total: String(clicksTotal.sum), date: today }],
+        });
+      }
     }
 
     const totalInteractions =

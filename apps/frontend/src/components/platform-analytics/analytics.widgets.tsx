@@ -132,6 +132,8 @@ const METRIC_LABEL_KEYS: Record<string, string> = {
   'Media Views by Source': 'metric_media_views_by_source',
   'Reactions by Type': 'metric_reactions_by_type',
   'Clicks by Type': 'metric_clicks_by_type',
+  'Link Clicks': 'metric_link_clicks',
+  'Clicks by Link': 'metric_clicks_by_link',
   'Traffic Sources': 'metric_traffic_sources',
   'Recent Posts Performance': 'metric_recent_posts_performance',
   'Top Videos Performance': 'metric_top_videos_performance',

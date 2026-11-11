@@ -946,6 +946,8 @@
   "metric_retweets": "Reposts",
   "metric_reactions": "Reactions",
   "metric_clicks": "Clicks",
+  "metric_link_clicks": "Link Clicks",
+  "metric_clicks_by_link": "Clicks by Link",
   "metric_outbound_clicks": "Outbound Clicks",
   "metric_pin_clicks": "Pin Clicks",
   "metric_pin_click_rate": "Pin Click Rate",
