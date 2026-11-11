@@ -9,6 +9,8 @@ on:
         required: false
         type: string
   push:
+    branches:
+      - main
     tags:
       - '*'
 
@@ -26,7 +28,14 @@ jobs:
       - name: Get Container Version
         id: getcontainerver
         run: |
-          VER="${{ inputs.tag || github.ref_name }}"
+          if [ -n "${{ inputs.tag }}" ]; then
+            VER="${{ inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VER="${{ github.ref_name }}"
+          else
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            VER="main-${SHORT_SHA}"
+          fi
           REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           echo "containerver=${VER}" >> "$GITHUB_OUTPUT"
           echo "imagename=ghcr.io/${REPO_LOWER}" >> "$GITHUB_OUTPUT"
@@ -66,6 +75,8 @@ jobs:
           docker buildx build --platform linux/${{ matrix.arch }} \
             -f Dockerfile.dev \
             -t ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-${{ matrix.arch }} \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.licenses=AGPL-3.0" \
             --build-arg NEXT_PUBLIC_VERSION=${{ env.NEXT_PUBLIC_VERSION }} \
             --pull \
             --no-cache \
