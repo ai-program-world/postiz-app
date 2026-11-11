@@ -27,6 +27,133 @@ export function getMaxSize(mimeType: string): number {
   }
 }
 
+export const INCOMPLETE_MP4_ERROR =
+  'Video file is corrupted or incomplete (missing moov atom). This usually means the file was uploaded before the encoder finished writing it — wait for the render to complete and upload it again.';
+
+// A playable mp4 must contain a top-level moov box (the index of the file).
+// Encoders write it last (or rewrite the file with it first for faststart),
+// so a file grabbed mid-encode has only ftyp + mdat and can't be played or
+// published anywhere.
+export function isCompleteMp4(buffer: Buffer): boolean {
+  let offset = 0;
+  while (offset + 8 <= buffer.length) {
+    let size: number = buffer.readUInt32BE(offset);
+    const type = buffer.toString('latin1', offset + 4, offset + 8);
+    if (type === 'moov') {
+      return true;
+    }
+    if (size === 0) {
+      // box extends to end of file
+      return false;
+    }
+    if (size === 1) {
+      if (offset + 16 > buffer.length) {
+        return false;
+      }
+      const largeSize = buffer.readBigUInt64BE(offset + 8);
+      if (largeSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+        return false;
+      }
+      size = Number(largeSize);
+      // a largesize box header is 16 bytes, so smaller values are malformed
+      if (size < 16) {
+        return false;
+      }
+    }
+    if (size < 8) {
+      return false;
+    }
+    offset += size;
+  }
+  return false;
+}
+
+// Streaming equivalent of isCompleteMp4: walks top-level ISO-BMFF box headers
+// keeping at most 16 header bytes in memory across chunk boundaries.
+export function mp4MoovCheckStream() {
+  let pos = 0;
+  let targetOffset = 0;
+  let headerBuf: Buffer = Buffer.alloc(0);
+  let foundMoov = false;
+  let moovEndOffset = 0;
+  let malformed = false;
+
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      while (
+        !foundMoov &&
+        !malformed &&
+        targetOffset !== Infinity &&
+        pos + chunk.length > targetOffset
+      ) {
+        const startInChunk = targetOffset >= pos ? targetOffset - pos : 0;
+        const needed = 16 - headerBuf.length;
+        if (needed > 0 && startInChunk < chunk.length) {
+          const slice = chunk.subarray(
+            startInChunk,
+            Math.min(chunk.length, startInChunk + needed)
+          );
+          headerBuf = headerBuf.length
+            ? Buffer.concat([headerBuf, slice])
+            : Buffer.from(slice);
+        }
+
+        if (headerBuf.length < 8) {
+          break;
+        }
+
+        let size = headerBuf.readUInt32BE(0);
+        const type = headerBuf.toString('latin1', 4, 8);
+
+        if (size === 1) {
+          if (headerBuf.length < 16) {
+            break;
+          }
+          const largeSize = headerBuf.readBigUInt64BE(8);
+          if (
+            largeSize < BigInt(16) ||
+            largeSize > BigInt(Number.MAX_SAFE_INTEGER)
+          ) {
+            malformed = true;
+            break;
+          }
+          size = Number(largeSize);
+        } else if (size === 0) {
+          if (type === 'moov') {
+            foundMoov = true;
+            moovEndOffset = 0;
+          }
+          targetOffset = Infinity;
+          headerBuf = Buffer.alloc(0);
+          break;
+        } else if (size < 8) {
+          malformed = true;
+          break;
+        }
+
+        if (type === 'moov') {
+          foundMoov = true;
+          moovEndOffset = targetOffset + size;
+          headerBuf = Buffer.alloc(0);
+          break;
+        }
+
+        targetOffset += size;
+        headerBuf = Buffer.alloc(0);
+      }
+
+      pos += chunk.length;
+      callback(null, chunk);
+    },
+    flush(callback) {
+      if (!foundMoov || pos < moovEndOffset) {
+        return callback(new BadRequestException(INCOMPLETE_MP4_ERROR));
+      }
+      callback();
+    },
+  });
+}
+
 // Passes bytes through and fails once they exceed maxSize, so a body with a
 // missing or lying Content-Length cannot be streamed into storage unbounded
 export function maxSizeStream(maxSize: number) {
@@ -71,12 +198,15 @@ export async function uploadStreamToStorage(
     throw new BadRequestException('File is too large.');
   }
 
-  // pipeline (not pipe) so failing the cap also tears down the source
-  const body = pipeline(
+  // pipeline (not pipe) so failing the cap or moov check also tears down the source
+  const streams: any[] = [
     Readable.fromWeb(sniffed as any),
     maxSizeStream(maxSize),
-    () => {}
-  );
+  ];
+  if (detected.mime === 'video/mp4') {
+    streams.push(mp4MoovCheckStream());
+  }
+  const body = (pipeline as any)(...streams, () => {});
 
   try {
     const uploaded = await storage.uploadStream(
