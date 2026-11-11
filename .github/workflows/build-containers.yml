@@ -3,20 +3,33 @@ name: "Build Containers"
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Container tag to publish (defaults to ref name)'
+        required: false
+        type: string
   push:
     tags:
       - '*'
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   build-containers-common:
     runs-on: ubuntu-latest
     outputs:
       containerver: ${{ steps.getcontainerver.outputs.containerver }}
+      imagename: ${{ steps.getcontainerver.outputs.imagename }}
     steps:
       - name: Get Container Version
         id: getcontainerver
         run: |
-          echo "containerver=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          VER="${{ inputs.tag || github.ref_name }}"
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "containerver=${VER}" >> "$GITHUB_OUTPUT"
+          echo "imagename=ghcr.io/${REPO_LOWER}" >> "$GITHUB_OUTPUT"
 
   build-containers:
     needs: build-containers-common
@@ -47,16 +60,17 @@ jobs:
       - name: Build and Push Image
         env:
           CONTAINERVER: ${{ needs.build-containers-common.outputs.containerver }}
-          NEXT_PUBLIC_VERSION: ${{ github.ref_name }}
+          IMAGENAME: ${{ needs.build-containers-common.outputs.imagename }}
+          NEXT_PUBLIC_VERSION: ${{ needs.build-containers-common.outputs.containerver }}
         run: |
           docker buildx build --platform linux/${{ matrix.arch }} \
             -f Dockerfile.dev \
-            -t ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}-${{ matrix.arch }} \
+            -t ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-${{ matrix.arch }} \
             --build-arg NEXT_PUBLIC_VERSION=${{ env.NEXT_PUBLIC_VERSION }} \
             --pull \
             --no-cache \
             --provenance=false --sbom=false \
-            --output "type=registry,name=ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}-${{ matrix.arch }}" .
+            --output "type=registry,name=${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-${{ matrix.arch }}" .
 
   build-container-manifest:
     needs: [build-containers, build-containers-common]
@@ -72,32 +86,26 @@ jobs:
       - name: Create Docker Manifest
         env:
           CONTAINERVER: ${{ needs.build-containers-common.outputs.containerver }}
+          IMAGENAME: ${{ needs.build-containers-common.outputs.imagename }}
         run: |
           # Verify the architecture images
           echo "Verifying AMD64 image:"
-          docker buildx imagetools inspect ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}-amd64
+          docker buildx imagetools inspect ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-amd64
           
           echo "Verifying ARM64 image:"
-          docker buildx imagetools inspect ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}-arm64
+          docker buildx imagetools inspect ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-arm64
           
-          # Try to remove any existing manifests first
-          docker manifest rm ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }} || true
-          docker manifest rm ghcr.io/gitroomhq/postiz-app:latest || true
-          
-          # Create and push the version-specific manifest
-          docker manifest create ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }} \
-            --amend ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}-amd64 \
-            --amend ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}-arm64
+          # Create and push multi-arch manifests using buildx imagetools
+          docker buildx imagetools create -t ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }} \
+            ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-amd64 \
+            ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-arm64
 
-          docker manifest push ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}
-
-          # Create and push the latest manifest
-          docker manifest create ghcr.io/gitroomhq/postiz-app:latest \
-            --amend ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}-amd64 \
-            --amend ghcr.io/gitroomhq/postiz-app:${{ env.CONTAINERVER }}-arm64
-
-          docker manifest push ghcr.io/gitroomhq/postiz-app:latest
+          docker buildx imagetools create -t ${{ env.IMAGENAME }}:latest \
+            ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-amd64 \
+            ${{ env.IMAGENAME }}:${{ env.CONTAINERVER }}-arm64
 
       - name: Verify Manifest
+        env:
+          IMAGENAME: ${{ needs.build-containers-common.outputs.imagename }}
         run: |
-          docker manifest inspect ghcr.io/gitroomhq/postiz-app:latest
+          docker buildx imagetools inspect ${{ env.IMAGENAME }}:latest
