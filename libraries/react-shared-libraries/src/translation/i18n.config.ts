@@ -4,6 +4,7 @@ export const languages = [
   'he',
   'ru',
   'zh',
+  'zh-TW',
   'fr',
   'es',
   'pt',

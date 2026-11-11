@@ -1,125 +1,18 @@
 import { FC, useCallback, useMemo, useState } from 'react';
 import { Integration } from '@prisma/client';
 import useSWR from 'swr';
+import dayjs from 'dayjs';
+import clsx from 'clsx';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
-import { ChartSocial } from '@gitroom/frontend/components/analytics/chart-social';
 import { LoadingComponent } from '@gitroom/frontend/components/layout/loading';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
-
-interface AnalyticsDataItem {
-  label: string;
-  data: Array<{ total: number; date: string }>;
-  average?: boolean;
-  percentageChange?: number;
-}
-
-const TrendIndicator: FC<{ value: number; average?: boolean }> = ({
-  value,
-  average,
-}) => {
-  if (value === 0) return null;
-
-  const isPositive = value > 0;
-  const displayValue = Math.abs(value).toFixed(1);
-
-  return (
-    <div
-      className={`flex items-center gap-[4px] text-[13px] font-medium ${
-        isPositive ? 'text-[#32d583]' : 'text-[#f97066]'
-      }`}
-    >
-      <svg
-        width="12"
-        height="12"
-        viewBox="0 0 12 12"
-        fill="none"
-        className={isPositive ? '' : 'rotate-180'}
-      >
-        <path
-          d="M6 2.5L10 7.5H2L6 2.5Z"
-          fill="currentColor"
-        />
-      </svg>
-      <span>
-        {displayValue}
-        {average ? 'pp' : '%'}
-      </span>
-    </div>
-  );
-};
-
-const AnalyticsCard: FC<{
-  item: AnalyticsDataItem;
-  total: string | number;
-  index: number;
-}> = ({ item, total, index }) => {
-  const colorVariants = ['purple', 'green', 'blue'] as const;
-  const color = colorVariants[index % colorVariants.length];
-
-  const hasDataPoints = item.data.length >= 1;
-
-  return (
-    <div className="group relative">
-      <div
-        className={`
-          flex flex-col h-full
-          bg-newTableHeader
-          border border-newTableBorder
-          rounded-[12px]
-          overflow-hidden
-          transition-all duration-200
-          hover:border-[#612bd3]/50
-        `}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-[16px] pt-[14px] pb-[8px]">
-          <div className="flex items-center gap-[10px]">
-            <div
-              className={`
-                w-[8px] h-[8px] rounded-full
-                ${color === 'purple' ? 'bg-[#612bd3]' : ''}
-                ${color === 'green' ? 'bg-[#32d583]' : ''}
-                ${color === 'blue' ? 'bg-[#1d9bf0]' : ''}
-              `}
-            />
-            <span className="text-[15px] font-medium text-newTableText">
-              {item.label}
-            </span>
-          </div>
-          {item.percentageChange !== undefined && (
-            <TrendIndicator value={item.percentageChange} average={item.average} />
-          )}
-        </div>
-
-        {/* Content */}
-        {hasDataPoints ? (
-          <>
-            {/* Chart */}
-            <div className="flex-1 px-[12px] py-[8px]">
-              <div className="h-[120px] relative">
-                <ChartSocial data={item.data} color={color} key={`chart-${index}`} />
-              </div>
-            </div>
-
-            {/* Value */}
-            <div className="px-[16px] pb-[14px]">
-              <div className="text-[36px] leading-[42px] font-semibold tracking-tight">
-                {total}
-              </div>
-            </div>
-          </>
-        ) : (
-          /* Single value display */
-          <div className="flex-1 flex flex-col items-center justify-center py-[32px] px-[16px]">
-            <div className="text-[48px] leading-[56px] font-semibold tracking-tight">
-              {total}
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
+import {
+  AnalyticsBreakdownCard,
+  AnalyticsKpiCard,
+  AnalyticsPostsLeaderboard,
+  RichAnalyticsItem,
+  splitAnalyticsSections,
+} from '@gitroom/frontend/components/platform-analytics/analytics.widgets';
 
 const EmptyState: FC<{ onRefresh: () => void }> = ({ onRefresh }) => {
   const t = useT();
@@ -173,26 +66,47 @@ export const RenderAnalytics: FC<{
 }> = (props) => {
   const { integration, date } = props;
   const [loading, setLoading] = useState(true);
+  const [refreshingData, setRefreshingData] = useState(false);
   const fetch = useFetch();
+  const t = useT();
 
   const load = useCallback(async () => {
     setLoading(true);
-    const load = (
-      await fetch(`/analytics/${integration.id}?date=${date}`)
-    ).json();
-    setLoading(false);
-    return load;
-  }, [integration, date]);
+    try {
+      return await (
+        await fetch(`/analytics/${integration.id}?date=${date}`)
+      ).json();
+    } finally {
+      setLoading(false);
+    }
+  }, [integration, date, fetch]);
 
-  const { data } = useSWR(`/analytics-${integration?.id}-${date}`, load, {
-    refreshInterval: 0,
-    refreshWhenHidden: false,
-    revalidateOnFocus: false,
-    revalidateOnReconnect: false,
-    revalidateIfStale: false,
-    refreshWhenOffline: false,
-    revalidateOnMount: true,
-  });
+  const { data, mutate } = useSWR<RichAnalyticsItem[]>(
+    `/analytics-${integration?.id}-${date}`,
+    load,
+    {
+      refreshInterval: 0,
+      refreshWhenHidden: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      refreshWhenOffline: false,
+      revalidateOnMount: true,
+    }
+  );
+
+  const handleForceRefresh = useCallback(async () => {
+    if (refreshingData) return;
+    setRefreshingData(true);
+    try {
+      const fresh = await (
+        await fetch(`/analytics/${integration.id}?date=${date}&refresh=true`)
+      ).json();
+      await mutate(fresh, { revalidate: false });
+    } finally {
+      setRefreshingData(false);
+    }
+  }, [fetch, integration.id, date, mutate, refreshingData]);
 
   const refreshChannel = useCallback(
     (
@@ -211,21 +125,19 @@ export const RenderAnalytics: FC<{
         ).json();
         window.location.href = url;
       },
-    []
+    [fetch]
   );
 
-  const t = useT();
+  const { kpiItems, breakdownItems, postLeaderboardItems } = useMemo(
+    () => splitAnalyticsSections(Array.isArray(data) ? data : []),
+    [data]
+  );
 
-  const totals = useMemo(() => {
-    return data?.map((p: AnalyticsDataItem) => {
-      const value =
-        (p?.data.reduce((acc: number, curr: { total: number }) => acc + curr.total, 0) || 0) /
-        (p.average ? p.data.length : 1);
-      if (p.average) {
-        return value.toFixed(2) + '%';
-      }
-      return new Intl.NumberFormat().format(Math.round(value));
-    });
+  const updatedAtDisplay = useMemo(() => {
+    const raw = Array.isArray(data) ? data[0]?.updatedAt : undefined;
+    if (!raw) return null;
+    const parsed = dayjs(raw);
+    return parsed.isValid() ? parsed.format('YYYY-MM-DD HH:mm') : null;
   }, [data]);
 
   if (loading) {
@@ -236,17 +148,91 @@ export const RenderAnalytics: FC<{
     );
   }
 
-  return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-[16px]">
-      {data?.length === 0 && (
+  if (!data || data.length === 0) {
+    return (
+      <div className="grid grid-cols-1 gap-[16px]">
         <EmptyState onRefresh={refreshChannel(integration as any)} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-[24px]">
+      {/* Toolbar: Last Updated + Force Refresh */}
+      <div className="flex flex-wrap items-center justify-between gap-[10px]">
+        <div className="text-[13px] text-gray-400">
+          {updatedAtDisplay && (
+            <span>
+              {t('analytics_last_updated', 'Last updated')}: {updatedAtDisplay}
+            </span>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={handleForceRefresh}
+          disabled={refreshingData}
+          className={clsx(
+            'inline-flex items-center gap-[6px] px-[12px] py-[6px] text-[13px] font-medium rounded-[8px] border border-newTableBorder bg-newTableHeader hover:border-[#612bd3]/60 transition-colors',
+            refreshingData && 'opacity-60 cursor-not-allowed'
+          )}
+        >
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            className={clsx(refreshingData && 'animate-spin')}
+          >
+            <path d="M23 4v6h-6M1 20v-6h6" />
+            <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
+          </svg>
+          {refreshingData
+            ? t('refreshing_analytics', 'Refreshing...')
+            : t('force_refresh_analytics', 'Refresh Data')}
+        </button>
+      </div>
+
+      {/* Section 1: KPI & Trend Cards */}
+      {kpiItems.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-[16px]">
+          {kpiItems.map((item, index) => (
+            <AnalyticsKpiCard
+              key={`kpi-${item.label}-${index}`}
+              item={item}
+              index={index}
+            />
+          ))}
+        </div>
       )}
-      {data?.map((item: AnalyticsDataItem, index: number) => (
-        <AnalyticsCard
-          key={`analytics-${index}`}
+
+      {/* Section 2: Audience, Traffic & Format Breakdowns */}
+      {breakdownItems.length > 0 && (
+        <div className="flex flex-col gap-[12px]">
+          <h3 className="text-[16px] font-semibold text-newTableText">
+            {t(
+              'section_audience_traffic',
+              'Audience, Traffic & Content Breakdown'
+            )}
+          </h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-[16px]">
+            {breakdownItems.map((item, index) => (
+              <AnalyticsBreakdownCard
+                key={`bd-${item.label}-${index}`}
+                item={item}
+                index={index}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Section 3: Recent / Top Posts Leaderboard */}
+      {postLeaderboardItems.map((item, index) => (
+        <AnalyticsPostsLeaderboard
+          key={`posts-${item.label}-${index}`}
           item={item}
-          total={totals[index]}
-          index={index}
         />
       ))}
     </div>

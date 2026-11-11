@@ -19,6 +19,7 @@ import 'dayjs/locale/en';
 import 'dayjs/locale/he';
 import 'dayjs/locale/ru';
 import 'dayjs/locale/zh';
+import 'dayjs/locale/zh-tw';
 import 'dayjs/locale/fr';
 import 'dayjs/locale/es';
 import 'dayjs/locale/pt';
@@ -71,7 +72,7 @@ extend(localizedFormat);
 // Initialize language
 const updateDayjsLocale = () => {
   const currentLanguage = i18next.resolvedLanguage || 'en';
-  dayjs.locale(currentLanguage);
+  dayjs.locale(currentLanguage.toLowerCase());
 };
 
 // Set dayjs locale whenever i18next language changes

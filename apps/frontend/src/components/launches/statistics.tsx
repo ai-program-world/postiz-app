@@ -1,18 +1,18 @@
 import React, { FC, Fragment, useCallback, useMemo, useState } from 'react';
-import useSWR, { useSWRConfig } from 'swr';
+import useSWR from 'swr';
+import dayjs from 'dayjs';
+import clsx from 'clsx';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
-import { ChartSocial } from '@gitroom/frontend/components/analytics/chart-social';
 import { Select } from '@gitroom/react/form/select';
 import { LoadingComponent } from '@gitroom/frontend/components/layout/loading';
 import { MissingReleaseModal } from '@gitroom/frontend/components/launches/missing-release.modal';
-
-interface AnalyticsData {
-  label: string;
-  data: Array<{ total: number; date: string }>;
-  percentageChange: number;
-  average?: boolean;
-}
+import {
+  AnalyticsBreakdownCard,
+  AnalyticsKpiCard,
+  RichAnalyticsItem,
+  splitAnalyticsSections,
+} from '@gitroom/frontend/components/platform-analytics/analytics.widgets';
 
 export const StatisticsModal: FC<{
   postId: string;
@@ -21,6 +21,7 @@ export const StatisticsModal: FC<{
   const t = useT();
   const fetch = useFetch();
   const [dateRange, setDateRange] = useState(7);
+  const [refreshing, setRefreshing] = useState(false);
 
   const loadStatistics = useCallback(async () => {
     return (await fetch(`/posts/${postId}/statistics`)).json();
@@ -35,20 +36,34 @@ export const StatisticsModal: FC<{
     loadStatistics
   );
 
-  const { data: analyticsData, isLoading: isLoadingAnalytics, mutate: mutateAnalytics } = useSWR(
-    `/analytics/post/${postId}?date=${dateRange}`,
-    loadPostAnalytics,
-    {
-      revalidateOnFocus: false,
-      revalidateOnReconnect: false,
-      revalidateIfStale: false,
-      revalidateOnMount: true,
-      refreshWhenHidden: false,
-      refreshWhenOffline: false,
-    }
-  );
+  const {
+    data: analyticsData,
+    isLoading: isLoadingAnalytics,
+    mutate: mutateAnalytics,
+  } = useSWR(`/analytics/post/${postId}?date=${dateRange}`, loadPostAnalytics, {
+    revalidateOnFocus: false,
+    revalidateOnReconnect: false,
+    revalidateIfStale: false,
+    revalidateOnMount: true,
+    refreshWhenHidden: false,
+    refreshWhenOffline: false,
+  });
 
-  const isMissing = analyticsData && !Array.isArray(analyticsData) && analyticsData.missing;
+  const handleForceRefresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const fresh = await (
+        await fetch(`/analytics/post/${postId}?date=${dateRange}&refresh=true`)
+      ).json();
+      await mutateAnalytics(fresh, { revalidate: false });
+    } finally {
+      setRefreshing(false);
+    }
+  }, [fetch, postId, dateRange, mutateAnalytics, refreshing]);
+
+  const isMissing =
+    analyticsData && !Array.isArray(analyticsData) && analyticsData.missing;
 
   const dateOptions = useMemo(() => {
     return [
@@ -58,17 +73,20 @@ export const StatisticsModal: FC<{
     ];
   }, [t]);
 
-  const totals = useMemo(() => {
-    if (!analyticsData || !Array.isArray(analyticsData)) return [];
-    return analyticsData.map((p: AnalyticsData) => {
-      const value =
-        (p?.data?.reduce((acc: number, curr: any) => acc + Number(curr.total), 0) || 0) /
-        (p.average ? p.data.length : 1);
-      if (p.average) {
-        return value.toFixed(2) + '%';
-      }
-      return Math.round(value);
-    });
+  const { kpiItems, breakdownItems } = useMemo(() => {
+    if (!analyticsData || !Array.isArray(analyticsData)) {
+      return { kpiItems: [], breakdownItems: [] };
+    }
+    return splitAnalyticsSections(analyticsData as RichAnalyticsItem[]);
+  }, [analyticsData]);
+
+  const updatedAtDisplay = useMemo(() => {
+    const raw = Array.isArray(analyticsData)
+      ? analyticsData[0]?.updatedAt
+      : undefined;
+    if (!raw) return null;
+    const parsed = dayjs(raw);
+    return parsed.isValid() ? parsed.format('YYYY-MM-DD HH:mm') : null;
   }, [analyticsData]);
 
   const isLoading = isLoadingStatistics || isLoadingAnalytics;
@@ -80,71 +98,99 @@ export const StatisticsModal: FC<{
           <LoadingComponent />
         </div>
       ) : isMissing ? (
-        <MissingReleaseModal postId={postId} onSuccess={() => mutateAnalytics()} />
+        <MissingReleaseModal
+          postId={postId}
+          onSuccess={() => mutateAnalytics()}
+        />
       ) : (
         <div className="flex flex-col gap-[24px]">
           {/* Post Analytics Section */}
-          {analyticsData && Array.isArray(analyticsData) && analyticsData.length > 0 && (
-            <div className="flex flex-col gap-[14px]">
-              <div className="flex items-center justify-between">
-                <h3 className="text-[18px] font-[500]">
-                  {t('post_analytics', 'Post Analytics')}
-                </h3>
-                <div className="max-w-[150px]">
-                  <Select
-                    label=""
-                    name="date"
-                    disableForm={true}
-                    hideErrors={true}
-                    value={dateRange}
-                    onChange={(e) => setDateRange(+e.target.value)}
-                  >
-                    {dateOptions.map((option) => (
-                      <option key={option.key} value={option.key}>
-                        {option.value}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-[16px]">
-                {analyticsData.map((p: AnalyticsData, index: number) => {
-                  const colorVariants = ['purple', 'green', 'blue'] as const;
-                  const color = colorVariants[index % colorVariants.length];
-                  return (
-                    <div key={`analytics-${index}`} className="group">
-                      <div className="flex flex-col h-full bg-newTableHeader border border-newTableBorder rounded-[12px] overflow-hidden transition-all duration-200 hover:border-[#612bd3]/50">
-                        <div className="flex items-center justify-between px-[16px] pt-[14px] pb-[8px]">
-                          <div className="flex items-center gap-[10px]">
-                            <div
-                              className={`w-[8px] h-[8px] rounded-full ${
-                                color === 'purple' ? 'bg-[#612bd3]' : ''
-                              } ${color === 'green' ? 'bg-[#32d583]' : ''} ${
-                                color === 'blue' ? 'bg-[#1d9bf0]' : ''
-                              }`}
-                            />
-                            <span className="text-[15px] font-medium text-newTableText">
-                              {p.label}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="flex-1 px-[12px] py-[8px]">
-                          <div className="h-[120px] relative">
-                            <ChartSocial data={p.data} color={color} key={`chart-${index}`} />
-                          </div>
-                        </div>
-                        <div className="px-[16px] pb-[14px]">
-                          <div className="text-[36px] leading-[42px] font-semibold tracking-tight">
-                            {totals[index]}
-                          </div>
-                        </div>
-                      </div>
+          {analyticsData &&
+            Array.isArray(analyticsData) &&
+            analyticsData.length > 0 && (
+              <div className="flex flex-col gap-[16px]">
+                <div className="flex flex-wrap items-center justify-between gap-[12px]">
+                  <div className="flex flex-col gap-[2px]">
+                    <h3 className="text-[18px] font-[500]">
+                      {t('post_analytics', 'Post Analytics')}
+                    </h3>
+                    {updatedAtDisplay && (
+                      <span className="text-[12px] text-gray-400">
+                        {t('analytics_last_updated', 'Last updated')}:{' '}
+                        {updatedAtDisplay}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-[10px]">
+                    <button
+                      type="button"
+                      onClick={handleForceRefresh}
+                      disabled={refreshing}
+                      className={clsx(
+                        'inline-flex items-center gap-[6px] px-[12px] py-[8px] text-[13px] font-medium rounded-[8px] border border-newTableBorder bg-newTableHeader hover:border-[#612bd3]/60 transition-colors',
+                        refreshing && 'opacity-60 cursor-not-allowed'
+                      )}
+                    >
+                      <svg
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        className={clsx(refreshing && 'animate-spin')}
+                      >
+                        <path d="M23 4v6h-6M1 20v-6h6" />
+                        <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
+                      </svg>
+                      {refreshing
+                        ? t('refreshing_analytics', 'Refreshing...')
+                        : t('force_refresh_analytics', 'Refresh Data')}
+                    </button>
+                    <div className="w-[130px]">
+                      <Select
+                        label=""
+                        name="date"
+                        disableForm={true}
+                        hideErrors={true}
+                        value={dateRange}
+                        onChange={(e) => setDateRange(+e.target.value)}
+                      >
+                        {dateOptions.map((option) => (
+                          <option key={option.key} value={option.key}>
+                            {option.value}
+                          </option>
+                        ))}
+                      </Select>
                     </div>
-                  );
-                })}
+                  </div>
+                </div>
+
+                {kpiItems.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-[16px]">
+                    {kpiItems.map((p, index) => (
+                      <AnalyticsKpiCard
+                        key={`post-kpi-${p.label}-${index}`}
+                        item={p}
+                        index={index}
+                      />
+                    ))}
+                  </div>
+                )}
+
+                {breakdownItems.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-[16px]">
+                    {breakdownItems.map((p, index) => (
+                      <AnalyticsBreakdownCard
+                        key={`post-bd-${p.label}-${index}`}
+                        item={p}
+                        index={index}
+                      />
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
-          )}
+            )}
 
           {/* Short Links Statistics Section */}
           <div className="flex flex-col gap-[14px]">
@@ -184,10 +230,15 @@ export const StatisticsModal: FC<{
           </div>
 
           {/* No analytics available message */}
-          {(!analyticsData || !Array.isArray(analyticsData) || analyticsData.length === 0) &&
+          {(!analyticsData ||
+            !Array.isArray(analyticsData) ||
+            analyticsData.length === 0) &&
             (!statisticsData?.clicks || statisticsData.clicks.length === 0) && (
               <div className="text-center text-gray-400 py-[20px]">
-                {t('no_statistics_available', 'No statistics available for this post')}
+                {t(
+                  'no_statistics_available',
+                  'No statistics available for this post'
+                )}
               </div>
             )}
         </div>

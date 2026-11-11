@@ -6,25 +6,51 @@ import { TotalList } from '@gitroom/frontend/components/analytics/stars.and.fork
 import { chunk } from 'lodash';
 import useCookie from 'react-use-cookie';
 
-function mergeDataPoints(data: TotalList[], numPoints: number): TotalList[] {
+function mergeDataPoints(
+  data: Array<{ total: number | string; date: string }>,
+  numPoints: number,
+  aggregation: 'sum' | 'average' | 'latest' = 'sum'
+): TotalList[] {
   const res = chunk(data, Math.ceil(data.length / numPoints));
   return res.map((row) => {
+    const nums = row.map((curr) => Number(curr.total) || 0);
+    let bucketTotal = 0;
+    if (aggregation === 'latest') {
+      bucketTotal = nums[nums.length - 1] ?? 0;
+    } else {
+      const sum = nums.reduce((acc, v) => acc + v, 0);
+      bucketTotal =
+        aggregation === 'average' && nums.length > 0 ? sum / nums.length : sum;
+    }
     return {
-      date: `${row[0].date} - ${row?.at(-1)?.date}`,
-      total: row.reduce((acc, curr) => acc + curr.total, 0),
+      date:
+        row.length === 1
+          ? row[0].date
+          : `${row[0].date} - ${row?.at(-1)?.date}`,
+      total: Number.isInteger(bucketTotal)
+        ? bucketTotal
+        : Number(bucketTotal.toFixed(2)),
     };
   });
 }
 
 export const ChartSocial: FC<{
-  data: TotalList[];
+  data: Array<{ total: number | string; date: string }>;
   color?: 'purple' | 'green' | 'blue';
+  aggregation?: 'sum' | 'average' | 'latest';
 }> = (props) => {
-  const { data, color = 'purple' } = props;
+  const { data, color = 'purple', aggregation = 'sum' } = props;
   const [mode] = useCookie('mode', 'dark');
 
   const list = useMemo(() => {
-    const merged = data.length < 7 ? data : mergeDataPoints(data, 7);
+    const normalized: TotalList[] = (data || []).map((pt) => ({
+      date: pt.date,
+      total: Number(pt.total) || 0,
+    }));
+    const merged =
+      normalized.length < 7
+        ? normalized
+        : mergeDataPoints(normalized, 7, aggregation);
     if (merged.length === 1) {
       return [
         // duplicating single datapoints metrics for chart to display a line on analytics
@@ -33,7 +59,7 @@ export const ChartSocial: FC<{
       ];
     }
     return merged;
-  }, [data]);
+  }, [data, aggregation]);
 
   const ref = useRef<any>(null);
   const chart = useRef<null | DrawChart>(null);
@@ -146,7 +172,7 @@ export const ChartSocial: FC<{
     return () => {
       chart?.current?.destroy();
     };
-  }, []);
+  }, [list, mode, colors.border, colors.start, colors.end]);
 
   return <canvas className="w-full h-full" ref={ref} />;
 };
