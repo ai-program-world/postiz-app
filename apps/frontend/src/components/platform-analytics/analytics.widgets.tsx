@@ -78,6 +78,7 @@ const METRIC_LABEL_KEYS: Record<string, string> = {
   Comments: 'metric_comments',
   'Recent Comments': 'metric_recent_comments',
   Replies: 'metric_replies',
+  'Story Replies': 'metric_story_replies',
   Shares: 'metric_shares',
   'Recent Shares': 'metric_recent_shares',
   Reposts: 'metric_reposts',

@@ -935,6 +935,7 @@
   "metric_comments": "留言數",
   "metric_recent_comments": "區間留言數",
   "metric_replies": "回覆數",
+  "metric_story_replies": "限時動態回覆數",
   "metric_shares": "分享數",
   "metric_recent_shares": "區間分享數",
   "metric_reposts": "轉發數",
