@@ -38,8 +38,9 @@ export const ChartSocial: FC<{
   data: Array<{ total: number | string; date: string }>;
   color?: 'purple' | 'green' | 'blue';
   aggregation?: 'sum' | 'average' | 'latest';
+  maxPoints?: number;
 }> = (props) => {
-  const { data, color = 'purple', aggregation = 'sum' } = props;
+  const { data, color = 'purple', aggregation = 'sum', maxPoints = 7 } = props;
   const [mode] = useCookie('mode', 'dark');
 
   const list = useMemo(() => {
@@ -48,9 +49,9 @@ export const ChartSocial: FC<{
       total: Number(pt.total) || 0,
     }));
     const merged =
-      normalized.length < 7
+      normalized.length < maxPoints
         ? normalized
-        : mergeDataPoints(normalized, 7, aggregation);
+        : mergeDataPoints(normalized, maxPoints, aggregation);
     if (merged.length === 1) {
       return [
         // duplicating single datapoints metrics for chart to display a line on analytics
@@ -59,7 +60,7 @@ export const ChartSocial: FC<{
       ];
     }
     return merged;
-  }, [data, aggregation]);
+  }, [data, aggregation, maxPoints]);
 
   const ref = useRef<any>(null);
   const chart = useRef<null | DrawChart>(null);
