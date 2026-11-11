@@ -1401,25 +1401,10 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
               videoId
                 ? safeAnalyticsCall(
                     `fb.post.watch_time.${p.id}`,
-                    async () => {
-                      // Reels expose fb_reels_avg_watch_time, regular videos
-                      // total_video_avg_time_watched; asking for both in one call
-                      // fails when either is unsupported for the video type.
-                      const reels = await safeAnalyticsCall(
-                        `fb.post.reels_watch_time.${p.id}`,
-                        () =>
-                          this.fetchFbJson(
-                            `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=fb_reels_avg_watch_time&access_token=${accessToken}`
-                          ),
-                        null
-                      );
-                      if (reels?.data?.[0]?.values?.[0]?.value !== undefined) {
-                        return reels;
-                      }
-                      return this.fetchFbJson(
-                        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=total_video_avg_time_watched&access_token=${accessToken}`
-                      );
-                    },
+                    () =>
+                      this.fetchFbJson(
+                        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=post_video_avg_time_watched&access_token=${accessToken}`
+                      ),
                     null
                   )
                 : Promise.resolve(null),
@@ -1696,7 +1681,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
           'fb.video.retention',
           async () => {
             const r = await fetch(
-              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=total_video_avg_time_watched,total_video_view_total_time,fb_reels_avg_watch_time&access_token=${accessToken}`
+              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=post_video_avg_time_watched,post_video_view_time&access_token=${accessToken}`
             );
             return r.json();
           },
@@ -1828,8 +1813,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
               }
             }
             break;
-          case 'total_video_avg_time_watched':
-          case 'fb_reels_avg_watch_time':
+          case 'post_video_avg_time_watched':
             if (
               typeof value === 'number' &&
               value > 0 &&
@@ -1850,7 +1834,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
               });
             }
             break;
-          case 'total_video_view_total_time':
+          case 'post_video_view_time':
             if (typeof value === 'number' && value > 0) {
               result.push({
                 label: 'Total Watch Time',
