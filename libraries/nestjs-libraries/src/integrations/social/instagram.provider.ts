@@ -1741,14 +1741,27 @@ export class InstagramProvider
         const items: any[] = mediaRes?.data || [];
         const enriched = await Promise.all(
           items.map(async (m) => {
-            const ins = await safeAnalyticsCall(
-              `ig.media_insight.${m.id}`,
-              () =>
-                this.fetchIgJson(
-                  `https://${type}/${META_GRAPH_API_VERSION}/${m.id}/insights?metric=views,reach,saved,shares&access_token=${accessToken}`
-                ),
-              null
-            );
+            const [ins, reelIns] = await Promise.all([
+              safeAnalyticsCall(
+                `ig.media_insight.${m.id}`,
+                () =>
+                  this.fetchIgJson(
+                    `https://${type}/${META_GRAPH_API_VERSION}/${m.id}/insights?metric=views,reach,saved,shares&access_token=${accessToken}`
+                  ),
+                null
+              ),
+              m.media_product_type === 'REELS'
+                ? safeAnalyticsCall(
+                    `ig.media_watch_time.${m.id}`,
+                    () =>
+                      this.fetchIgJson(
+                        `https://${type}/${META_GRAPH_API_VERSION}/${m.id}/insights?metric=ig_reels_avg_watch_time&access_token=${accessToken}`
+                      ),
+                    null
+                  )
+                : Promise.resolve(null),
+            ]);
+            const avgWatchMs = reelIns?.data?.[0]?.values?.[0]?.value;
             const map: Record<string, number> = {};
             for (const row of ins?.data || []) {
               const v = row?.values?.[0]?.value ?? row?.total_value?.value;
@@ -1781,6 +1794,10 @@ export class InstagramProvider
               engagementRate:
                 denom > 0
                   ? Number(((interactions / denom) * 100).toFixed(2))
+                  : undefined,
+              avgWatchTimeSeconds:
+                avgWatchMs !== undefined
+                  ? Number(((Number(avgWatchMs) || 0) / 1000).toFixed(1))
                   : undefined,
             } as AnalyticsPostItem;
           })

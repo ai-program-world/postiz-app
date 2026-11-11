@@ -1362,14 +1362,18 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       'fb.recent_posts',
       async () => {
         const feedRes = await this.fetchFbJson(
-          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?fields=id,message,permalink_url,full_picture,created_time,shares&limit=10&access_token=${accessToken}`
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?fields=id,message,permalink_url,full_picture,created_time,shares,attachments{media_type,target}&limit=10&access_token=${accessToken}`
         );
         const posts: any[] = feedRes?.data || [];
         return Promise.all(
           posts.map(async (p) => {
+            // Reels / videos keep watch time on the video node, not the post
+            const videoId = (p?.attachments?.data || []).find((a: any) =>
+              String(a?.media_type || '').startsWith('video')
+            )?.target?.id;
             // Views/reach are requested on their own so an invalid engagement
             // metric can't fail the whole call and blank the view counts.
-            const [viewsRes, insRes, countsRes] = await Promise.all([
+            const [viewsRes, insRes, countsRes, watchRes] = await Promise.all([
               safeAnalyticsCall(
                 `fb.post.views.${p.id}`,
                 () =>
@@ -1394,7 +1398,33 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
                   ),
                 null
               ),
+              videoId
+                ? safeAnalyticsCall(
+                    `fb.post.watch_time.${p.id}`,
+                    async () => {
+                      // Reels expose fb_reels_avg_watch_time, regular videos
+                      // total_video_avg_time_watched; asking for both in one call
+                      // fails when either is unsupported for the video type.
+                      const reels = await safeAnalyticsCall(
+                        `fb.post.reels_watch_time.${p.id}`,
+                        () =>
+                          this.fetchFbJson(
+                            `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=fb_reels_avg_watch_time&access_token=${accessToken}`
+                          ),
+                        null
+                      );
+                      if (reels?.data?.[0]?.values?.[0]?.value !== undefined) {
+                        return reels;
+                      }
+                      return this.fetchFbJson(
+                        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=total_video_avg_time_watched&access_token=${accessToken}`
+                      );
+                    },
+                    null
+                  )
+                : Promise.resolve(null),
             ]);
+            const avgWatchMs = watchRes?.data?.[0]?.values?.[0]?.value;
 
             let views: number | undefined;
             let reach: number | undefined;
@@ -1444,6 +1474,10 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
               engagementRate:
                 engagementBase > 0
                   ? Number(((interactions / engagementBase) * 100).toFixed(2))
+                  : undefined,
+              avgWatchTimeSeconds:
+                typeof avgWatchMs === 'number'
+                  ? Number((avgWatchMs / 1000).toFixed(1))
                   : undefined,
             } as AnalyticsPostItem;
           })
