@@ -464,7 +464,8 @@ export class IntegrationService {
     org: Organization,
     integration: string,
     date: string,
-    forceRefresh = false
+    forceRefresh = false,
+    skipCache = false
   ): Promise<AnalyticsData[]> {
     // Days to load, missing or invalid on some public API calls (same default as the app)
     const days = Number(date) > 0 ? Number(date) : 7;
@@ -507,32 +508,40 @@ export class IntegrationService {
       }
     }
 
-    const getIntegrationData = await ioRedis.get(
-      `integration:${org.id}:${integration}:${days}`
-    );
-    if (getIntegrationData) {
-      return JSON.parse(getIntegrationData);
+    const cacheKey = `integration:${org.id}:${integration}:${days}`;
+    if (!skipCache) {
+      const getIntegrationData = await ioRedis.get(cacheKey);
+      if (getIntegrationData) {
+        return JSON.parse(getIntegrationData);
+      }
     }
 
     if (integrationProvider.analytics) {
       try {
-        const loadAnalytics = await integrationProvider.analytics(
+        const rawAnalytics = await integrationProvider.analytics(
           getIntegration.internalId,
           getIntegration.token,
           days
         );
-        await ioRedis.set(
-          `integration:${org.id}:${integration}:${days}`,
-          JSON.stringify(loadAnalytics),
-          'EX',
-          !process.env.NODE_ENV || process.env.NODE_ENV === 'development'
-            ? 1
-            : 3600
-        );
+        const updatedAt = new Date().toISOString();
+        const loadAnalytics = (rawAnalytics || []).map((item) => ({
+          ...item,
+          updatedAt: item.updatedAt || updatedAt,
+        }));
+        if (loadAnalytics.length > 0) {
+          await ioRedis.set(
+            cacheKey,
+            JSON.stringify(loadAnalytics),
+            'EX',
+            !process.env.NODE_ENV || process.env.NODE_ENV === 'development'
+              ? 1
+              : 3600
+          );
+        }
         return loadAnalytics;
       } catch (e) {
-        if (e instanceof RefreshToken) {
-          return this.checkAnalytics(org, integration, date, true);
+        if (e instanceof RefreshToken && !forceRefresh) {
+          return this.checkAnalytics(org, integration, date, true, skipCache);
         }
       }
     }

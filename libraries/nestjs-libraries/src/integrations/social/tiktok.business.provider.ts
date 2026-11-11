@@ -1,5 +1,6 @@
 import {
   AnalyticsData,
+  AnalyticsPostItem,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -15,6 +16,15 @@ import {
   SocialAbstract,
   ValidityMedia,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  aggregatePoints,
+  buildBreakdown,
+  computePercentageChange,
+  mergeDailyPoints,
+  safeAnalyticsCall,
+  splitDateWindows,
+  summarizePostTitle,
+} from '@gitroom/nestjs-libraries/integrations/social/analytics.helper';
 import { TikTokDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/tiktok.dto';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
@@ -937,30 +947,80 @@ export class TiktokBusinessProvider
   private async loadVideoList(
     accessToken: string,
     businessId: string,
-    fields: string[]
+    fields: string[],
+    stopBeforeUnix?: number,
+    maxPages = 1
   ) {
-    const videoListData = await (
-      await this.fetch(
-        `${this.baseUrl}/business/video/list/?business_id=${encodeURIComponent(
-          businessId
-        )}&fields=${encodeURIComponent(
-          JSON.stringify(fields)
-        )}&max_count=20`,
-        {
-          method: 'GET',
-          headers: {
-            'Access-Token': accessToken,
-          },
+    const allVideos: any[] = [];
+    let cursor: number | string | undefined = undefined;
+
+    for (let page = 0; page < maxPages; page++) {
+      const cursorParam =
+        cursor !== undefined && cursor !== null
+          ? `&cursor=${encodeURIComponent(String(cursor))}`
+          : '';
+      const videoListData = await (
+        await this.fetch(
+          `${this.baseUrl}/business/video/list/?business_id=${encodeURIComponent(
+            businessId
+          )}&fields=${encodeURIComponent(
+            JSON.stringify(fields)
+          )}&max_count=20${cursorParam}`,
+          {
+            method: 'GET',
+            headers: {
+              'Access-Token': accessToken,
+            },
+          }
+        )
+      ).json();
+
+      // Same HTTP 200 + non-zero code envelope: a token error must surface as
+      // RefreshToken so the analytics/missing callers refresh and retry instead
+      // of silently showing empty data until the user reconnects.
+      this.throwIfTokenError(videoListData);
+
+      if (videoListData?.code && videoListData.code !== 0) {
+        if (page === 0) {
+          throw new Error(
+            videoListData?.message ||
+              `TikTok Business video/list error (${videoListData.code})`
+          );
         }
-      )
-    ).json();
+        break;
+      }
 
-    // Same HTTP 200 + non-zero code envelope: a token error must surface as
-    // RefreshToken so the analytics/missing callers refresh and retry instead
-    // of silently showing empty data until the user reconnects.
-    this.throwIfTokenError(videoListData);
+      const batch: any[] = videoListData?.data?.videos || [];
+      if (!batch.length) {
+        break;
+      }
 
-    return videoListData?.data?.videos;
+      allVideos.push(...batch);
+
+      const oldestInBatch = batch.reduce((min, v) => {
+        const ts = Number(v.create_time) || 0;
+        return ts > 0 && ts < min ? ts : min;
+      }, Number.MAX_SAFE_INTEGER);
+
+      if (
+        !videoListData?.data?.has_more ||
+        videoListData?.data?.cursor === undefined ||
+        (stopBeforeUnix !== undefined &&
+          oldestInBatch < Number.MAX_SAFE_INTEGER &&
+          oldestInBatch < stopBeforeUnix)
+      ) {
+        break;
+      }
+      cursor = videoListData.data.cursor;
+    }
+
+    return allVideos;
+  }
+
+  private normalizePercentRate(raw: any): number {
+    const val = Number(raw);
+    if (!Number.isFinite(val) || val < 0) return 0;
+    return val <= 1 ? Number((val * 100).toFixed(2)) : Number(val.toFixed(2));
   }
 
   // photo posts (p_pub_... / p_inbox_...) live under /photo/, TikTok rejects
@@ -996,10 +1056,16 @@ export class TiktokBusinessProvider
     accessToken: string,
     date: number
   ): Promise<AnalyticsData[]> {
+    const safeDays = Math.max(1, Math.min(365, Math.floor(date || 7)));
     const today = dayjs().format('YYYY-MM-DD');
+    const sinceUnix = dayjs().subtract(safeDays, 'day').startOf('day').unix();
+    const prevSinceUnix = dayjs()
+      .subtract(safeDays * 2, 'day')
+      .startOf('day')
+      .unix();
 
     try {
-      // Real-time account stats (followers, following, likes, videos)
+      // 1. Core real-time account stats (always available with user.info.stats)
       const userStatsData = await (
         await this.fetch(
           `${this.baseUrl}/business/get/?business_id=${encodeURIComponent(
@@ -1024,14 +1090,65 @@ export class TiktokBusinessProvider
       this.throwIfTokenError(userStatsData);
 
       const userStats = userStatsData?.data;
-
       const result: AnalyticsData[] = [];
+
+      // 2. Optional Business Account daily metrics & audience demographics (chunked <= 58 days)
+      const insightsBundle = await safeAnalyticsCall(
+        'tiktok.business.get.insights',
+        async () => {
+          const windows = splitDateWindows(safeDays, 58);
+          const dailyMetrics: any[] = [];
+          let audienceCountries: any[] = [];
+          let audienceGenders: any[] = [];
+
+          for (const win of windows) {
+            // TikTok Business insights lag ~24-48h; cap end_date at yesterday if needed
+            const sDate = dayjs.unix(win.since).format('YYYY-MM-DD');
+            const eDate = dayjs.unix(win.until).format('YYYY-MM-DD');
+            const insData = await (
+              await this.fetch(
+                `${this.baseUrl}/business/get/?business_id=${encodeURIComponent(
+                  id
+                )}&start_date=${sDate}&end_date=${eDate}&fields=${encodeURIComponent(
+                  JSON.stringify([
+                    'metrics',
+                    'audience_countries',
+                    'audience_genders',
+                  ])
+                )}`,
+                {
+                  method: 'GET',
+                  headers: {
+                    'Access-Token': accessToken,
+                  },
+                }
+              )
+            ).json();
+            this.throwIfTokenError(insData);
+            if (insData?.code === 0 && insData?.data) {
+              if (Array.isArray(insData.data.metrics)) {
+                dailyMetrics.push(...insData.data.metrics);
+              }
+              if (Array.isArray(insData.data.audience_countries)) {
+                audienceCountries = insData.data.audience_countries;
+              }
+              if (Array.isArray(insData.data.audience_genders)) {
+                audienceGenders = insData.data.audience_genders;
+              }
+            }
+          }
+          return { dailyMetrics, audienceCountries, audienceGenders };
+        },
+        { dailyMetrics: [], audienceCountries: [], audienceGenders: [] }
+      );
 
       if (userStats) {
         if (userStats.followers_count !== undefined) {
           result.push({
             label: 'Followers',
             percentageChange: 0,
+            aggregation: 'latest',
+            category: 'overview',
             data: [{ total: String(userStats.followers_count), date: today }],
           });
         }
@@ -1040,6 +1157,8 @@ export class TiktokBusinessProvider
           result.push({
             label: 'Following',
             percentageChange: 0,
+            aggregation: 'latest',
+            category: 'audience',
             data: [{ total: String(userStats.following_count), date: today }],
           });
         }
@@ -1048,6 +1167,8 @@ export class TiktokBusinessProvider
           result.push({
             label: 'Total Likes',
             percentageChange: 0,
+            aggregation: 'latest',
+            category: 'engagement',
             data: [{ total: String(userStats.total_likes), date: today }],
           });
         }
@@ -1056,56 +1177,463 @@ export class TiktokBusinessProvider
           result.push({
             label: 'Videos',
             percentageChange: 0,
+            aggregation: 'latest',
+            category: 'overview',
             data: [{ total: String(userStats.videos_count), date: today }],
           });
         }
       }
 
-      // Recent posts with their lifetime engagement, aggregated
-      const videos = await this.loadVideoList(accessToken, id, [
-        'item_id',
-        'likes',
-        'comments',
-        'shares',
-        'video_views',
-      ]);
+      if (insightsBundle.dailyMetrics.length > 0) {
+        const pushBizDaily = (
+          label: string,
+          field: string,
+          category: AnalyticsData['category'] = 'overview'
+        ) => {
+          const pts = mergeDailyPoints(
+            insightsBundle.dailyMetrics
+              .filter((m) => m?.date && m[field] !== undefined)
+              .map((m) => ({
+                date: String(m.date),
+                total: Number(m[field]) || 0,
+              }))
+          );
+          if (pts.length > 0) {
+            result.push({
+              label,
+              percentageChange: 0,
+              aggregation: 'sum',
+              category,
+              data: pts,
+            });
+          }
+        };
 
-      if (videos && videos.length > 0) {
-        let totalViews = 0;
-        let totalLikes = 0;
-        let totalComments = 0;
-        let totalShares = 0;
+        pushBizDaily('Profile Views', 'profile_views', 'overview');
+        pushBizDaily('Engaged Audience', 'engaged_audience', 'audience');
+      }
 
-        for (const video of videos) {
-          totalViews += video.video_views || 0;
-          totalLikes += video.likes || 0;
-          totalComments += video.comments || 0;
-          totalShares += video.shares || 0;
+      // 3. Paginated video list with rich fields (falling back gracefully if extended fields fail)
+      const loadRichVideos = async () => {
+        try {
+          return await this.loadVideoList(
+            accessToken,
+            id,
+            [
+              'item_id',
+              'caption',
+              'create_time',
+              'thumbnail_url',
+              'share_url',
+              'video_duration',
+              'likes',
+              'comments',
+              'shares',
+              'video_views',
+              'reach',
+              'full_video_watched_rate',
+              'average_time_watched',
+            ],
+            prevSinceUnix,
+            5
+          );
+        } catch (err) {
+          if (err instanceof RefreshToken || err instanceof Disconnect) {
+            throw err;
+          }
+          try {
+            return await this.loadVideoList(
+              accessToken,
+              id,
+              [
+                'item_id',
+                'caption',
+                'create_time',
+                'thumbnail_url',
+                'share_url',
+                'likes',
+                'comments',
+                'shares',
+                'video_views',
+              ],
+              prevSinceUnix,
+              5
+            );
+          } catch (innerErr) {
+            if (
+              innerErr instanceof RefreshToken ||
+              innerErr instanceof Disconnect
+            ) {
+              throw innerErr;
+            }
+            return await this.loadVideoList(
+              accessToken,
+              id,
+              ['item_id', 'likes', 'comments', 'shares', 'video_views'],
+              undefined,
+              1
+            );
+          }
         }
+      };
+
+      const allVideos = await safeAnalyticsCall(
+        'tiktok.business.video.list',
+        loadRichVideos,
+        []
+      );
+
+      if (allVideos && allVideos.length > 0) {
+        const hasTimestamps = allVideos.some((v) => Number(v.create_time) > 0);
+        const windowVideos = hasTimestamps
+          ? allVideos.filter((v) => Number(v.create_time) >= sinceUnix)
+          : allVideos;
+        const prevWindowVideos = hasTimestamps
+          ? allVideos.filter(
+              (v) =>
+                Number(v.create_time) >= prevSinceUnix &&
+                Number(v.create_time) < sinceUnix
+            )
+          : [];
+
+        const usingFallbackLatest =
+          hasTimestamps && windowVideos.length === 0 && allVideos.length > 0;
+        const activeVideos = usingFallbackLatest
+          ? allVideos.slice(0, 20)
+          : windowVideos;
+        const fallbackNote = usingFallbackLatest
+          ? `No new videos published in the last ${safeDays} days; showing latest ${activeVideos.length} videos`
+          : undefined;
+
+        const sumStats = (list: any[]) =>
+          list.reduce(
+            (acc, v) => {
+              acc.views += Number(v.video_views) || 0;
+              acc.reach += Number(v.reach) || 0;
+              acc.likes += Number(v.likes) || 0;
+              acc.comments += Number(v.comments) || 0;
+              acc.shares += Number(v.shares) || 0;
+              if (v.average_time_watched !== undefined) {
+                acc.watchSum += Number(v.average_time_watched) || 0;
+                acc.watchCount += 1;
+              }
+              if (v.full_video_watched_rate !== undefined) {
+                acc.completionSum += this.normalizePercentRate(
+                  v.full_video_watched_rate
+                );
+                acc.completionCount += 1;
+              }
+              return acc;
+            },
+            {
+              views: 0,
+              reach: 0,
+              likes: 0,
+              comments: 0,
+              shares: 0,
+              watchSum: 0,
+              watchCount: 0,
+              completionSum: 0,
+              completionCount: 0,
+            }
+          );
+
+        const currTotals = sumStats(activeVideos);
+        const prevTotals =
+          !usingFallbackLatest && prevWindowVideos.length > 0
+            ? sumStats(prevWindowVideos)
+            : undefined;
+
+        const groupDaily = (list: any[], field: string) => {
+          if (!list.length || usingFallbackLatest || !hasTimestamps) {
+            return null;
+          }
+          const map = new Map<string, number>();
+          for (const v of list) {
+            const ts = Number(v.create_time) || 0;
+            if (!ts) continue;
+            const d = dayjs.unix(ts).format('YYYY-MM-DD');
+            map.set(d, (map.get(d) || 0) + (Number(v[field]) || 0));
+          }
+          const pts = mergeDailyPoints(
+            Array.from(map.entries()).map(([d, total]) => ({
+              date: d,
+              total,
+            }))
+          );
+          return pts.length > 0 ? pts : null;
+        };
+
+        const bizDailyViews =
+          insightsBundle.dailyMetrics.length > 0
+            ? mergeDailyPoints(
+                insightsBundle.dailyMetrics
+                  .filter((m) => m?.date && m.video_views !== undefined)
+                  .map((m) => ({
+                    date: String(m.date),
+                    total: Number(m.video_views) || 0,
+                  }))
+              )
+            : [];
 
         result.push({
           label: 'Views',
-          percentageChange: 0,
-          data: [{ total: String(totalViews), date: today }],
+          percentageChange: computePercentageChange(
+            bizDailyViews.length > 0
+              ? aggregatePoints(bizDailyViews, 'sum')
+              : currTotals.views,
+            prevTotals?.views
+          ),
+          aggregation: 'sum',
+          category: 'overview',
+          note: bizDailyViews.length > 0 ? undefined : fallbackNote,
+          data:
+            bizDailyViews.length > 0
+              ? bizDailyViews
+              : groupDaily(activeVideos, 'video_views') || [
+                  { total: String(currTotals.views), date: today },
+                ],
+        });
+
+        if (currTotals.reach > 0) {
+          result.push({
+            label: 'Reach',
+            percentageChange: computePercentageChange(
+              currTotals.reach,
+              prevTotals?.reach
+            ),
+            aggregation: 'sum',
+            category: 'overview',
+            note: fallbackNote,
+            data: groupDaily(activeVideos, 'reach') || [
+              { total: String(currTotals.reach), date: today },
+            ],
+          });
+        }
+
+        result.push({
+          label: 'Videos in Period',
+          percentageChange: hasTimestamps
+            ? computePercentageChange(
+                windowVideos.length,
+                prevWindowVideos.length || undefined
+              )
+            : 0,
+          aggregation: 'latest',
+          category: 'overview',
+          data: [{ total: String(windowVideos.length), date: today }],
         });
 
         result.push({
           label: 'Recent Likes',
-          percentageChange: 0,
-          data: [{ total: String(totalLikes), date: today }],
+          percentageChange: computePercentageChange(
+            currTotals.likes,
+            prevTotals?.likes
+          ),
+          aggregation: 'sum',
+          category: 'engagement',
+          note: fallbackNote,
+          data: groupDaily(activeVideos, 'likes') || [
+            { total: String(currTotals.likes), date: today },
+          ],
         });
 
         result.push({
           label: 'Recent Comments',
-          percentageChange: 0,
-          data: [{ total: String(totalComments), date: today }],
+          percentageChange: computePercentageChange(
+            currTotals.comments,
+            prevTotals?.comments
+          ),
+          aggregation: 'sum',
+          category: 'engagement',
+          note: fallbackNote,
+          data: groupDaily(activeVideos, 'comments') || [
+            { total: String(currTotals.comments), date: today },
+          ],
         });
 
         result.push({
           label: 'Recent Shares',
-          percentageChange: 0,
-          data: [{ total: String(totalShares), date: today }],
+          percentageChange: computePercentageChange(
+            currTotals.shares,
+            prevTotals?.shares
+          ),
+          aggregation: 'sum',
+          category: 'engagement',
+          note: fallbackNote,
+          data: groupDaily(activeVideos, 'shares') || [
+            { total: String(currTotals.shares), date: today },
+          ],
         });
+
+        const currInteractions =
+          currTotals.likes + currTotals.comments + currTotals.shares;
+        const currEr =
+          currTotals.views > 0
+            ? Number(((currInteractions / currTotals.views) * 100).toFixed(2))
+            : 0;
+        const prevEr =
+          prevTotals && prevTotals.views > 0
+            ? Number(
+                (
+                  ((prevTotals.likes +
+                    prevTotals.comments +
+                    prevTotals.shares) /
+                    prevTotals.views) *
+                  100
+                ).toFixed(2)
+              )
+            : undefined;
+
+        result.push({
+          label: 'Engagement Rate',
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          note: fallbackNote,
+          percentageChange: computePercentageChange(currEr, prevEr, true),
+          data: [{ total: String(currEr), date: today }],
+        });
+
+        if (currTotals.watchCount > 0) {
+          const avgWatch = Number(
+            (currTotals.watchSum / currTotals.watchCount).toFixed(1)
+          );
+          const prevAvgWatch =
+            prevTotals && prevTotals.watchCount > 0
+              ? Number((prevTotals.watchSum / prevTotals.watchCount).toFixed(1))
+              : undefined;
+          result.push({
+            label: 'Average Watch Time',
+            average: true,
+            unit: 'seconds',
+            aggregation: 'latest',
+            category: 'retention',
+            note: fallbackNote,
+            percentageChange: computePercentageChange(avgWatch, prevAvgWatch),
+            data: [{ total: String(avgWatch), date: today }],
+          });
+        }
+
+        if (currTotals.completionCount > 0) {
+          const avgComp = Number(
+            (currTotals.completionSum / currTotals.completionCount).toFixed(2)
+          );
+          const prevAvgComp =
+            prevTotals && prevTotals.completionCount > 0
+              ? Number(
+                  (
+                    prevTotals.completionSum / prevTotals.completionCount
+                  ).toFixed(2)
+                )
+              : undefined;
+          result.push({
+            label: 'Completion Rate',
+            average: true,
+            unit: 'percent',
+            aggregation: 'latest',
+            category: 'retention',
+            note: fallbackNote,
+            percentageChange: computePercentageChange(
+              avgComp,
+              prevAvgComp,
+              true
+            ),
+            data: [{ total: String(avgComp), date: today }],
+          });
+        }
+
+        const postItems: AnalyticsPostItem[] = activeVideos
+          .slice(0, 15)
+          .map((v) => {
+            const views = Number(v.video_views) || 0;
+            const reach =
+              v.reach !== undefined ? Number(v.reach) || 0 : undefined;
+            const likes = Number(v.likes) || 0;
+            const comments = Number(v.comments) || 0;
+            const shares = Number(v.shares) || 0;
+            const er =
+              views > 0
+                ? Number(
+                    (((likes + comments + shares) / views) * 100).toFixed(2)
+                  )
+                : 0;
+            const pubIso =
+              Number(v.create_time) > 0
+                ? dayjs.unix(Number(v.create_time)).toISOString()
+                : today;
+
+            return {
+              id: String(v.item_id),
+              title: summarizePostTitle(v.caption, `TikTok ${v.item_id}`),
+              url: v.share_url ? String(v.share_url).split('?')[0] : undefined,
+              thumbnail: v.thumbnail_url || undefined,
+              publishedAt: pubIso,
+              mediaType: 'VIDEO',
+              views,
+              reach,
+              likes,
+              comments,
+              shares,
+              engagementRate: er,
+              avgWatchTimeSeconds:
+                v.average_time_watched !== undefined
+                  ? Number(Number(v.average_time_watched).toFixed(1))
+                  : undefined,
+            };
+          });
+
+        if (postItems.length > 0) {
+          result.push({
+            label: 'Recent Posts Performance',
+            percentageChange: 0,
+            category: 'posts',
+            note: fallbackNote,
+            posts: postItems,
+            data: [{ total: String(currTotals.views), date: today }],
+          });
+        }
+      }
+
+      if (insightsBundle.audienceCountries.length > 0) {
+        const breakdown = buildBreakdown(
+          insightsBundle.audienceCountries.map((c: any) => ({
+            label: String(c.country || ''),
+            value: this.normalizePercentRate(c.percentage),
+          })),
+          10
+        );
+        if (breakdown.length > 0) {
+          result.push({
+            label: 'Followers by Country',
+            percentageChange: 0,
+            unit: 'percent',
+            category: 'audience',
+            breakdown,
+            data: [{ total: '100', date: today }],
+          });
+        }
+      }
+
+      if (insightsBundle.audienceGenders.length > 0) {
+        const breakdown = buildBreakdown(
+          insightsBundle.audienceGenders.map((g: any) => ({
+            label: String(g.gender || ''),
+            value: this.normalizePercentRate(g.percentage),
+          })),
+          6
+        );
+        if (breakdown.length > 0) {
+          result.push({
+            label: 'Followers by Gender',
+            percentageChange: 0,
+            unit: 'percent',
+            category: 'audience',
+            breakdown,
+            data: [{ total: '100', date: today }],
+          });
+        }
       }
 
       return result;
@@ -1226,25 +1754,55 @@ export class TiktokBusinessProvider
     const today = dayjs().format('YYYY-MM-DD');
 
     try {
-      const videoQueryData = await (
-        await this.fetch(
-          `${this.baseUrl}/business/video/list/?business_id=${encodeURIComponent(
-            integrationId
-          )}&fields=${encodeURIComponent(
-            JSON.stringify(['item_id', 'likes', 'comments', 'shares', 'video_views'])
-          )}&filters=${encodeURIComponent(
-            JSON.stringify({ video_ids: [postId] })
-          )}`,
-          {
-            method: 'GET',
-            headers: {
-              'Access-Token': accessToken,
-            },
-          }
-        )
-      ).json();
+      const fetchSingleVideo = async (fields: string[]) => {
+        const videoQueryData = await (
+          await this.fetch(
+            `${this.baseUrl}/business/video/list/?business_id=${encodeURIComponent(
+              integrationId
+            )}&fields=${encodeURIComponent(
+              JSON.stringify(fields)
+            )}&filters=${encodeURIComponent(
+              JSON.stringify({ video_ids: [postId] })
+            )}`,
+            {
+              method: 'GET',
+              headers: {
+                'Access-Token': accessToken,
+              },
+            }
+          )
+        ).json();
+        this.throwIfTokenError(videoQueryData);
+        return videoQueryData;
+      };
 
-      this.throwIfTokenError(videoQueryData);
+      let videoQueryData = await fetchSingleVideo([
+        'item_id',
+        'caption',
+        'create_time',
+        'video_duration',
+        'likes',
+        'comments',
+        'shares',
+        'video_views',
+        'reach',
+        'full_video_watched_rate',
+        'average_time_watched',
+        'total_time_watched',
+        'new_followers',
+        'profile_views',
+        'impression_sources',
+      ]);
+
+      if (videoQueryData?.code && videoQueryData.code !== 0) {
+        videoQueryData = await fetchSingleVideo([
+          'item_id',
+          'likes',
+          'comments',
+          'shares',
+          'video_views',
+        ]);
+      }
 
       const video = videoQueryData?.data?.videos?.[0];
 
@@ -1253,12 +1811,29 @@ export class TiktokBusinessProvider
       }
 
       const result: AnalyticsData[] = [];
+      const views = Number(video.video_views) || 0;
+      const likes = Number(video.likes) || 0;
+      const comments = Number(video.comments) || 0;
+      const shares = Number(video.shares) || 0;
+      const totalInteractions = likes + comments + shares;
 
       if (video.video_views !== undefined) {
         result.push({
           label: 'Views',
           percentageChange: 0,
+          aggregation: 'latest',
+          category: 'overview',
           data: [{ total: String(video.video_views), date: today }],
+        });
+      }
+
+      if (video.reach !== undefined) {
+        result.push({
+          label: 'Reach',
+          percentageChange: 0,
+          aggregation: 'latest',
+          category: 'overview',
+          data: [{ total: String(video.reach), date: today }],
         });
       }
 
@@ -1266,6 +1841,8 @@ export class TiktokBusinessProvider
         result.push({
           label: 'Likes',
           percentageChange: 0,
+          aggregation: 'latest',
+          category: 'engagement',
           data: [{ total: String(video.likes), date: today }],
         });
       }
@@ -1274,6 +1851,8 @@ export class TiktokBusinessProvider
         result.push({
           label: 'Comments',
           percentageChange: 0,
+          aggregation: 'latest',
+          category: 'engagement',
           data: [{ total: String(video.comments), date: today }],
         });
       }
@@ -1282,8 +1861,125 @@ export class TiktokBusinessProvider
         result.push({
           label: 'Shares',
           percentageChange: 0,
+          aggregation: 'latest',
+          category: 'engagement',
           data: [{ total: String(video.shares), date: today }],
         });
+      }
+
+      result.push({
+        label: 'Total Interactions',
+        percentageChange: 0,
+        aggregation: 'latest',
+        category: 'engagement',
+        data: [{ total: String(totalInteractions), date: today }],
+      });
+
+      if (views > 0) {
+        const er = Number(((totalInteractions / views) * 100).toFixed(2));
+        result.push({
+          label: 'Engagement Rate',
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          percentageChange: 0,
+          data: [{ total: String(er), date: today }],
+        });
+      }
+
+      if (video.average_time_watched !== undefined) {
+        result.push({
+          label: 'Average Watch Time',
+          average: true,
+          unit: 'seconds',
+          aggregation: 'latest',
+          category: 'retention',
+          percentageChange: 0,
+          data: [
+            {
+              total: String(
+                Number((Number(video.average_time_watched) || 0).toFixed(1))
+              ),
+              date: today,
+            },
+          ],
+        });
+      }
+
+      if (
+        video.total_time_watched !== undefined &&
+        Number(video.total_time_watched) > 0
+      ) {
+        const totalMin = Number(
+          ((Number(video.total_time_watched) || 0) / 60).toFixed(2)
+        );
+        result.push({
+          label: 'Total Watch Time',
+          unit: 'minutes',
+          aggregation: 'latest',
+          category: 'retention',
+          percentageChange: 0,
+          data: [{ total: String(totalMin), date: today }],
+        });
+      }
+
+      if (video.full_video_watched_rate !== undefined) {
+        const completionPct = this.normalizePercentRate(
+          video.full_video_watched_rate
+        );
+        result.push({
+          label: 'Completion Rate',
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'retention',
+          percentageChange: 0,
+          data: [{ total: String(completionPct), date: today }],
+        });
+      }
+
+      if (video.new_followers !== undefined) {
+        result.push({
+          label: 'New Followers',
+          percentageChange: 0,
+          aggregation: 'latest',
+          category: 'audience',
+          data: [{ total: String(video.new_followers), date: today }],
+        });
+      }
+
+      if (video.profile_views !== undefined) {
+        result.push({
+          label: 'Profile Views',
+          percentageChange: 0,
+          aggregation: 'latest',
+          category: 'overview',
+          data: [{ total: String(video.profile_views), date: today }],
+        });
+      }
+
+      if (
+        Array.isArray(video.impression_sources) &&
+        video.impression_sources.length > 0
+      ) {
+        const breakdown = buildBreakdown(
+          video.impression_sources.map((src: any) => ({
+            label: String(src.impression_source || src.source || ''),
+            value: this.normalizePercentRate(src.percentage),
+          })),
+          10
+        );
+        if (breakdown.length > 0) {
+          result.push({
+            label: 'Traffic Sources',
+            percentageChange: 0,
+            unit: 'percent',
+            category: 'traffic',
+            breakdown,
+            data: [{ total: '100', date: today }],
+          });
+        }
       }
 
       return result;

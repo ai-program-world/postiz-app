@@ -1,5 +1,6 @@
 import {
   AnalyticsData,
+  AnalyticsPostItem,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -10,9 +11,22 @@ import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id'
 import dayjs from 'dayjs';
 import {
   BadBody,
+  Disconnect,
+  RefreshToken,
   SocialAbstract,
   ValidityMedia,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  aggregatePoints,
+  buildBreakdown,
+  computePercentageChange,
+  computeSeriesTrend,
+  mergeDailyPoints,
+  previousDateWindows,
+  safeAnalyticsCall,
+  splitDateWindows,
+  summarizePostTitle,
+} from '@gitroom/nestjs-libraries/integrations/social/analytics.helper';
 import {
   FacebookDto,
   FACEBOOK_PRESET_MAX_CHARS,
@@ -1026,34 +1040,28 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     ];
   }
 
+  private async fetchFbJson(url: string): Promise<any> {
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json?.error) {
+      if (json.error.code === 190) {
+        throw new RefreshToken(this.identifier, JSON.stringify(json), '{}');
+      }
+      throw new Error(json.error.message || 'Facebook Graph API error');
+    }
+    return json;
+  }
+
   async analytics(
     id: string,
     accessToken: string,
     date: number
   ): Promise<AnalyticsData[]> {
-    const until = dayjs().endOf('day').unix();
-    const since = dayjs().subtract(date, 'day').unix();
+    const today = dayjs().format('YYYY-MM-DD');
+    const windows = splitDateWindows(date, 28);
+    const prevWindows = date <= 30 ? previousDateWindows(date, 28) : [];
+    const result: AnalyticsData[] = [];
 
-    // Reach/impression metrics (page_impressions_unique, page_posts_impressions_unique,
-    // page_video_views) were deprecated by Meta on 2026-06-15 and now return an
-    // "invalid metric" error. They are replaced by the Media Views metrics, which
-    // require Graph API v23.0+:
-    //   - page_total_media_view_unique: total unique views on the page's media (reach)
-    //   - page_media_view: total media views, broken down between paid and organic
-    const { data, error } = await (
-      await fetch(
-        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/insights?metric=page_total_media_view_unique,page_media_view,page_post_engagements,page_daily_follows&access_token=${accessToken}&period=day&since=${since}&until=${until}`
-      )
-    ).json();
-
-    // Throw so checkAnalytics doesn't cache the empty result for an hour.
-    if (error) {
-      console.warn('Facebook page insights returned an error:', { id, error });
-      throw new Error(error.message);
-    }
-
-    // page_media_view returns paid/organic breakdowns as an object; sum them to
-    // keep the single-total UI working.
     const sumValue = (value: any): number => {
       if (value && typeof value === 'object') {
         return Object.values(value as Record<string, number>).reduce(
@@ -1064,23 +1072,380 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       return Number(value) || 0;
     };
 
-    return (
-      data?.map((d: any) => ({
-        label:
-          d.name === 'page_total_media_view_unique'
-            ? 'Page Impressions'
-            : d.name === 'page_post_engagements'
-            ? 'Posts Engagement'
-            : d.name === 'page_daily_follows'
-            ? 'Page followers'
-            : 'Media views',
-        percentageChange: 5,
-        data: d?.values?.map((v: any) => ({
-          total: sumValue(v.value),
-          date: dayjs(v.end_time).format('YYYY-MM-DD'),
-        })),
-      })) || []
+    // 1. Page overview snapshot (followers_count, fan_count)
+    const pageInfo = await safeAnalyticsCall(
+      'fb.page.info',
+      () =>
+        this.fetchFbJson(
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}?fields=followers_count,fan_count&access_token=${accessToken}`
+        ),
+      null
     );
+
+    if (pageInfo?.followers_count !== undefined) {
+      result.push({
+        label: 'Followers',
+        percentageChange: 0,
+        aggregation: 'latest',
+        unit: 'number',
+        category: 'overview',
+        data: [{ total: String(pageInfo.followers_count), date: today }],
+      });
+    }
+    if (pageInfo?.fan_count !== undefined) {
+      result.push({
+        label: 'Page Likes',
+        percentageChange: 0,
+        aggregation: 'latest',
+        unit: 'number',
+        category: 'overview',
+        data: [{ total: String(pageInfo.fan_count), date: today }],
+      });
+    }
+
+    // 2. Core Media Views & Engagement metrics (chunked <= 28d)
+    const coreMetricNames =
+      'page_total_media_view_unique,page_media_view,page_post_engagements,page_daily_follows';
+
+    const fetchCoreSeries = async (winList = windows) => {
+      const seriesMap: Record<
+        string,
+        Array<{ date: string; total: number }>
+      > = {};
+      const mediaSourceBreakdown: Record<string, number> = {};
+
+      for (const w of winList) {
+        const res = await this.fetchFbJson(
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/insights?metric=${coreMetricNames}&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+        );
+        for (const d of res?.data || []) {
+          seriesMap[d.name] = seriesMap[d.name] || [];
+          for (const v of d.values || []) {
+            seriesMap[d.name].push({
+              date: dayjs(v.end_time).format('YYYY-MM-DD'),
+              total: sumValue(v.value),
+            });
+            if (
+              d.name === 'page_media_view' &&
+              v.value &&
+              typeof v.value === 'object'
+            ) {
+              for (const [k, val] of Object.entries(
+                v.value as Record<string, number>
+              )) {
+                mediaSourceBreakdown[k] =
+                  (mediaSourceBreakdown[k] || 0) + (Number(val) || 0);
+              }
+            }
+          }
+        }
+      }
+      return { seriesMap, mediaSourceBreakdown };
+    };
+
+    // Throw on core error so checkAnalytics doesn't cache an empty result on fatal Page error
+    const currentCore = await fetchCoreSeries(windows);
+    const prevCore =
+      prevWindows.length > 0
+        ? await safeAnalyticsCall(
+            'fb.core.prev',
+            () => fetchCoreSeries(prevWindows),
+            {
+              seriesMap: {} as Record<
+                string,
+                Array<{ date: string; total: number }>
+              >,
+              mediaSourceBreakdown: {} as Record<string, number>,
+            }
+          )
+        : {
+            seriesMap: {} as Record<
+              string,
+              Array<{ date: string; total: number }>
+            >,
+            mediaSourceBreakdown: {} as Record<string, number>,
+          };
+
+    const labelForCore = (name: string) =>
+      name === 'page_total_media_view_unique'
+        ? 'Page Impressions'
+        : name === 'page_post_engagements'
+        ? 'Posts Engagement'
+        : name === 'page_daily_follows'
+        ? 'Page followers'
+        : 'Media views';
+
+    const coreSums: Record<string, number> = {};
+    const prevCoreSums: Record<string, number> = {};
+
+    for (const name of [
+      'page_total_media_view_unique',
+      'page_media_view',
+      'page_post_engagements',
+      'page_daily_follows',
+    ]) {
+      const pts = mergeDailyPoints(currentCore.seriesMap[name] || []);
+      if (pts.length === 0) continue;
+      const curSum = aggregatePoints(pts, 'sum');
+      coreSums[name] = curSum;
+      const prevPts = mergeDailyPoints(prevCore.seriesMap[name] || []);
+      const prevSum =
+        prevPts.length > 0 ? aggregatePoints(prevPts, 'sum') : undefined;
+      if (prevSum !== undefined) prevCoreSums[name] = prevSum;
+
+      result.push({
+        label: labelForCore(name),
+        percentageChange:
+          prevSum !== undefined
+            ? computePercentageChange(curSum, prevSum)
+            : computeSeriesTrend(pts, 'sum'),
+        aggregation: 'sum',
+        unit: 'number',
+        category:
+          name === 'page_post_engagements' ? 'engagement' : 'overview',
+        data: pts,
+      });
+    }
+
+    // 3. Extended Page metrics (page_views_total, page_daily_unfollows_unique, page_actions_post_reactions_total)
+    const [pageViewsPts, unfollowsPts, reactionsData] = await Promise.all([
+      safeAnalyticsCall(
+        'fb.page_views_total',
+        async () => {
+          const raw: Array<{ date: string; total: number }> = [];
+          for (const w of windows) {
+            const res = await this.fetchFbJson(
+              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/insights?metric=page_views_total&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+            );
+            for (const v of res?.data?.[0]?.values || []) {
+              raw.push({
+                date: dayjs(v.end_time).format('YYYY-MM-DD'),
+                total: sumValue(v.value),
+              });
+            }
+          }
+          return mergeDailyPoints(raw);
+        },
+        []
+      ),
+      safeAnalyticsCall(
+        'fb.page_daily_unfollows_unique',
+        async () => {
+          const raw: Array<{ date: string; total: number }> = [];
+          for (const w of windows) {
+            const res = await this.fetchFbJson(
+              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/insights?metric=page_daily_unfollows_unique&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+            );
+            for (const v of res?.data?.[0]?.values || []) {
+              raw.push({
+                date: dayjs(v.end_time).format('YYYY-MM-DD'),
+                total: sumValue(v.value),
+              });
+            }
+          }
+          return mergeDailyPoints(raw);
+        },
+        []
+      ),
+      safeAnalyticsCall(
+        'fb.reactions_total',
+        async () => {
+          const raw: Array<{ date: string; total: number }> = [];
+          const byType: Record<string, number> = {};
+          for (const w of windows) {
+            const res = await this.fetchFbJson(
+              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/insights?metric=page_actions_post_reactions_total&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+            );
+            for (const v of res?.data?.[0]?.values || []) {
+              raw.push({
+                date: dayjs(v.end_time).format('YYYY-MM-DD'),
+                total: sumValue(v.value),
+              });
+              if (v.value && typeof v.value === 'object') {
+                for (const [k, count] of Object.entries(
+                  v.value as Record<string, number>
+                )) {
+                  byType[k] = (byType[k] || 0) + (Number(count) || 0);
+                }
+              }
+            }
+          }
+          return { points: mergeDailyPoints(raw), byType };
+        },
+        { points: [], byType: {} as Record<string, number> }
+      ),
+    ]);
+
+    if (pageViewsPts.length > 0) {
+      result.push({
+        label: 'Page Views',
+        percentageChange: computeSeriesTrend(pageViewsPts, 'sum'),
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'traffic',
+        data: pageViewsPts,
+      });
+    }
+
+    if (unfollowsPts.length > 0) {
+      result.push({
+        label: 'Page Unfollows',
+        percentageChange: computeSeriesTrend(unfollowsPts, 'sum'),
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'overview',
+        data: unfollowsPts,
+      });
+    }
+
+    if (reactionsData.points.length > 0) {
+      result.push({
+        label: 'Post Reactions',
+        percentageChange: computeSeriesTrend(reactionsData.points, 'sum'),
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'engagement',
+        data: reactionsData.points,
+      });
+    }
+
+    // Derived Engagement Rate
+    const impSum =
+      coreSums.page_total_media_view_unique || coreSums.page_media_view || 0;
+    const engSum = coreSums.page_post_engagements || 0;
+    if (impSum > 0 && engSum >= 0) {
+      const rate = Number(((engSum / impSum) * 100).toFixed(2));
+      const prevImp =
+        prevCoreSums.page_total_media_view_unique ||
+        prevCoreSums.page_media_view ||
+        0;
+      const prevEng = prevCoreSums.page_post_engagements || 0;
+      const prevRate = prevImp > 0 ? (prevEng / prevImp) * 100 : undefined;
+      result.push({
+        label: 'Engagement Rate',
+        average: true,
+        unit: 'percent',
+        aggregation: 'latest',
+        category: 'engagement',
+        percentageChange: computePercentageChange(rate, prevRate, true),
+        data: [{ total: String(rate), date: today }],
+      });
+    }
+
+    // Breakdowns: Organic vs Paid media views & Reactions by Type
+    const mediaSourceBd = buildBreakdown(currentCore.mediaSourceBreakdown, 6);
+    if (mediaSourceBd.length > 0) {
+      const sum = mediaSourceBd.reduce((a, b) => a + b.value, 0);
+      result.push({
+        label: 'Media Views by Source',
+        percentageChange: 0,
+        category: 'traffic',
+        breakdown: mediaSourceBd,
+        data: [{ total: String(sum), date: today }],
+      });
+    }
+
+    const reactionsBd = buildBreakdown(reactionsData.byType, 8);
+    if (reactionsBd.length > 0) {
+      const sum = reactionsBd.reduce((a, b) => a + b.value, 0);
+      result.push({
+        label: 'Reactions by Type',
+        percentageChange: 0,
+        category: 'engagement',
+        breakdown: reactionsBd,
+        data: [{ total: String(sum), date: today }],
+      });
+    }
+
+    // 4. Recent Published Posts Leaderboard
+    const recentPosts = await safeAnalyticsCall<AnalyticsPostItem[]>(
+      'fb.recent_posts',
+      async () => {
+        const feedRes = await this.fetchFbJson(
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?fields=id,message,permalink_url,full_picture,created_time,shares&limit=10&access_token=${accessToken}`
+        );
+        const posts: any[] = feedRes?.data || [];
+        return Promise.all(
+          posts.map(async (p) => {
+            const [insRes, countsRes] = await Promise.all([
+              safeAnalyticsCall(
+                `fb.post.ins.${p.id}`,
+                () =>
+                  this.fetchFbJson(
+                    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_total_media_view_unique,post_clicks,post_reactions_by_type_total&access_token=${accessToken}`
+                  ),
+                null
+              ),
+              safeAnalyticsCall(
+                `fb.post.counts.${p.id}`,
+                () =>
+                  this.fetchFbJson(
+                    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}?fields=comments.summary(true).limit(0)&access_token=${accessToken}`
+                  ),
+                null
+              ),
+            ]);
+
+            let reach: number | undefined;
+            let clicks = 0;
+            let likes: number | undefined;
+            for (const m of insRes?.data || []) {
+              const v = m?.values?.[0]?.value;
+              if (v === undefined) continue;
+              if (m.name === 'post_total_media_view_unique') {
+                reach = Number(v) || 0;
+              } else if (m.name === 'post_clicks') {
+                clicks = Number(v) || 0;
+              } else if (m.name === 'post_reactions_by_type_total') {
+                likes = sumValue(v);
+              }
+            }
+            const comments =
+              countsRes?.comments?.summary?.total_count !== undefined
+                ? Number(countsRes.comments.summary.total_count) || 0
+                : undefined;
+            const shares =
+              p?.shares?.count !== undefined
+                ? Number(p.shares.count) || 0
+                : undefined;
+            const interactions =
+              (likes || 0) + (comments || 0) + (shares || 0) + clicks;
+
+            return {
+              id: String(p.id),
+              title: summarizePostTitle(p.message, 'Facebook Post'),
+              url: p.permalink_url,
+              thumbnail: p.full_picture,
+              publishedAt: p.created_time
+                ? dayjs(p.created_time).format('YYYY-MM-DD HH:mm')
+                : today,
+              reach,
+              views: reach,
+              likes,
+              comments,
+              shares,
+              engagementRate:
+                reach && reach > 0
+                  ? Number(((interactions / reach) * 100).toFixed(2))
+                  : undefined,
+            } as AnalyticsPostItem;
+          })
+        );
+      },
+      []
+    );
+
+    if (recentPosts.length > 0) {
+      result.push({
+        label: 'Recent Posts Performance',
+        percentageChange: 0,
+        category: 'posts',
+        posts: recentPosts,
+        data: [{ total: String(recentPosts.length), date: today }],
+      });
+    }
+
+    return result;
   }
 
   async postAnalytics(
@@ -1091,129 +1456,183 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
   ): Promise<AnalyticsData[]> {
     const today = dayjs().format('YYYY-MM-DD');
 
-    // The stored id (releaseId) shape depends on the post type set in post():
-    //   - feed post  -> `{pageid}_{postid}` (contains `_`), has an `insights` edge
-    //   - reel/video -> bare numeric video id, NO `insights` edge (only `video_insights`)
-    //   - story      -> bare story id, no usable insights via this path
-    // There is no separate stored type, so id shape is the discriminator. Calling
-    // `/{videoId}/insights` on a video/story node returns
-    // `(#100) Tried accessing nonexisting field (insights)`, which is what surfaced
-    // in prod as "Error fetching Facebook post analytics: ApplicationFailure". Route
-    // bare ids to the video-only edge instead.
+    // Feed post -> `{pageid}_{postid}`; reel/video -> bare numeric video id
     if (!postId.includes('_')) {
       return this.videoPostAnalytics(accessToken, postId, today);
     }
 
     try {
-      // Fetch post insights from Facebook Graph API.
-      // post_impressions_unique was deprecated by Meta on 2026-06-15; it is replaced
-      // by post_total_media_view_unique (unique media views = reach), available on
-      // Graph API v23.0+. Engagement metrics below are unaffected.
-      const { data } = await (
-        await fetch(
+      const [insightsRes, nodeRes] = await Promise.all([
+        this.fetchFbJson(
           `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${postId}/insights?metric=post_total_media_view_unique,post_reactions_by_type_total,post_clicks,post_clicks_by_type&access_token=${accessToken}`
-        )
-      ).json();
+        ),
+        safeAnalyticsCall(
+          'fb.post.node',
+          () =>
+            this.fetchFbJson(
+              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${postId}?fields=shares,comments.summary(true).limit(0)&access_token=${accessToken}`
+            ),
+          null
+        ),
+      ]);
 
-      if (!data || data.length === 0) {
-        return [];
-      }
-
+      const data = insightsRes?.data || [];
       const result: AnalyticsData[] = [];
+      let impressions = 0;
+      let reactions = 0;
+      let clicks = 0;
 
       for (const metric of data) {
         const value = metric.values?.[0]?.value;
         if (value === undefined) continue;
 
-        let label = '';
-        let total = '';
-
-        switch (metric.name) {
-          case 'post_total_media_view_unique':
-            label = 'Impressions';
-            total = String(value);
-            break;
-          case 'post_clicks':
-            label = 'Clicks';
-            total = String(value);
-            break;
-          case 'post_clicks_by_type':
-            // This returns an object with click types
-            if (typeof value === 'object') {
-              const totalClicks = Object.values(
-                value as Record<string, number>
-              ).reduce((sum: number, v: number) => sum + v, 0);
-              label = 'Clicks by Type';
-              total = String(totalClicks);
-            }
-            break;
-          case 'post_reactions_by_type_total':
-            // This returns an object with reaction types
-            if (typeof value === 'object') {
-              const totalReactions = Object.values(
-                value as Record<string, number>
-              ).reduce((sum: number, v: number) => sum + v, 0);
-              label = 'Reactions';
-              total = String(totalReactions);
-            }
-            break;
-        }
-
-        if (label) {
+        if (metric.name === 'post_total_media_view_unique') {
+          impressions = Number(value) || 0;
           result.push({
-            label,
+            label: 'Impressions',
             percentageChange: 0,
-            data: [{ total, date: today }],
+            unit: 'number',
+            aggregation: 'latest',
+            category: 'overview',
+            data: [{ total: String(impressions), date: today }],
+          });
+        } else if (metric.name === 'post_clicks') {
+          clicks = Number(value) || 0;
+          result.push({
+            label: 'Clicks',
+            percentageChange: 0,
+            unit: 'number',
+            aggregation: 'latest',
+            category: 'traffic',
+            data: [{ total: String(clicks), date: today }],
+          });
+        } else if (
+          metric.name === 'post_clicks_by_type' &&
+          typeof value === 'object'
+        ) {
+          const bd = buildBreakdown(value as Record<string, number>, 10);
+          const totalClicks = Object.values(
+            value as Record<string, number>
+          ).reduce((sum: number, v: number) => sum + (Number(v) || 0), 0);
+          result.push({
+            label: 'Clicks by Type',
+            percentageChange: 0,
+            unit: 'number',
+            aggregation: 'latest',
+            category: 'traffic',
+            breakdown: bd,
+            data: [{ total: String(totalClicks), date: today }],
+          });
+        } else if (
+          metric.name === 'post_reactions_by_type_total' &&
+          typeof value === 'object'
+        ) {
+          const bd = buildBreakdown(value as Record<string, number>, 10);
+          reactions = Object.values(value as Record<string, number>).reduce(
+            (sum: number, v: number) => sum + (Number(v) || 0),
+            0
+          );
+          result.push({
+            label: 'Reactions',
+            percentageChange: 0,
+            unit: 'number',
+            aggregation: 'latest',
+            category: 'engagement',
+            breakdown: bd,
+            data: [{ total: String(reactions), date: today }],
           });
         }
       }
 
+      const commentsCount = nodeRes?.comments?.summary?.total_count;
+      const sharesCount = nodeRes?.shares?.count;
+
+      if (commentsCount !== undefined) {
+        result.push({
+          label: 'Comments',
+          percentageChange: 0,
+          unit: 'number',
+          aggregation: 'latest',
+          category: 'engagement',
+          data: [{ total: String(Number(commentsCount) || 0), date: today }],
+        });
+      }
+
+      if (sharesCount !== undefined) {
+        result.push({
+          label: 'Shares',
+          percentageChange: 0,
+          unit: 'number',
+          aggregation: 'latest',
+          category: 'engagement',
+          data: [{ total: String(Number(sharesCount) || 0), date: today }],
+        });
+      }
+
+      const totalEng =
+        reactions +
+        clicks +
+        (Number(commentsCount) || 0) +
+        (Number(sharesCount) || 0);
+      if (impressions > 0 && totalEng >= 0) {
+        result.push({
+          label: 'Engagement Rate',
+          percentageChange: 0,
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          data: [
+            {
+              total: String(Number(((totalEng / impressions) * 100).toFixed(2))),
+              date: today,
+            },
+          ],
+        });
+      }
+
       return result;
     } catch (err) {
+      if (err instanceof RefreshToken || err instanceof Disconnect) {
+        throw err;
+      }
       console.error('Error fetching Facebook post analytics:', err);
       return [];
     }
   }
 
-  // Video/reel posts store a bare video id whose node has no `insights` edge; their
-  // analytics live on the `/{videoId}/video_insights` edge instead. Story posts also
-  // store a bare id but have no usable insights here — the video_insights call comes
-  // back with an `error` (or empty data), which we swallow to an empty result so a
-  // single story/video can't break the statistics page.
   private async videoPostAnalytics(
     accessToken: string,
     videoId: string,
     today: string
   ): Promise<AnalyticsData[]> {
     try {
-      // Metric names verified against the Graph API v23.0 video_insights docs:
-      //   - total_video_views: 3s+ (or full, if shorter) plays
-      //   - total_video_reactions_by_type_total: reactions object, keyed by type
-      // total_video_impressions is no longer accepted (Graph answers
-      // "The value must be a valid insights metric", which fails the whole
-      // request), so it is not requested.
-      // Reels never return the total_video_* metrics (the edge answers with an
-      // empty data array), only the reels ones, so both sets are requested at
-      // once and Graph simply omits the metrics that don't apply:
-      //   - fb_reels_total_plays: plays including replays
-      //   - post_video_likes_by_reaction_type: reactions object, keyed by type
-      //   - post_video_social_actions: comments/shares object, keyed by type
-      // Use plain fetch (not this.fetch) so a `(#100) nonexisting field` / story
-      // response doesn't throw an ApplicationFailure — we want a quiet `[]` instead.
-      const { data, error } = await (
-        await fetch(
+      const [coreVideoRes, retentionRes] = await Promise.all([
+        fetch(
           `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=total_video_views,total_video_reactions_by_type_total,fb_reels_total_plays,post_video_likes_by_reaction_type,post_video_social_actions&access_token=${accessToken}`
-        )
-      ).json();
+        ).then((r) => r.json()),
+        safeAnalyticsCall(
+          'fb.video.retention',
+          async () => {
+            const r = await fetch(
+              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=total_video_avg_time_watched,total_video_view_total_time,fb_reels_avg_watch_time&access_token=${accessToken}`
+            );
+            return r.json();
+          },
+          null
+        ),
+      ]);
 
-      // Stories (and videos without this edge) come back with an error / no data —
-      // return an empty result quietly rather than logging a scary error. But a
-      // `nonexisting field (video_insights)` is the only "expected" error here; any
-      // other error (bad metric name, token, permissions) means the fix is silently
-      // returning empty when it shouldn't be, so surface it as a warning (not a throw,
-      // not a scary error) so it's diagnosable without breaking the statistics page.
-      if (error || !data || data.length === 0) {
-        if (error && !/nonexisting field/i.test(error.message || '')) {
+      const { data, error } = coreVideoRes || {};
+      if (error) {
+        if (error.code === 190) {
+          throw new RefreshToken(
+            this.identifier,
+            JSON.stringify(coreVideoRes),
+            '{}'
+          );
+        }
+        if (!/nonexisting field/i.test(error.message || '')) {
           console.warn('Facebook video_insights returned an error:', {
             videoId,
             error,
@@ -1222,58 +1641,182 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
         return [];
       }
 
-      const result: AnalyticsData[] = [];
+      const allMetrics = [
+        ...(data || []),
+        ...(retentionRes?.error ? [] : retentionRes?.data || []),
+      ];
+      if (allMetrics.length === 0) {
+        return [];
+      }
 
-      for (const metric of data) {
+      const result: AnalyticsData[] = [];
+      let playsOrViews = 0;
+      let totalReactions = 0;
+      let totalActions = 0;
+
+      for (const metric of allMetrics) {
         const value = metric.values?.[0]?.value;
         if (value === undefined) continue;
 
-        let label = '';
-        let total = '';
-
         switch (metric.name) {
           case 'total_video_views':
-            label = 'Views';
-            total = String(value);
+            playsOrViews = playsOrViews || Number(value) || 0;
+            result.push({
+              label: 'Views',
+              percentageChange: 0,
+              unit: 'number',
+              aggregation: 'latest',
+              category: 'overview',
+              data: [{ total: String(value), date: today }],
+            });
             break;
           case 'fb_reels_total_plays':
-            label = 'Plays';
-            total = String(value);
+            playsOrViews = Number(value) || playsOrViews;
+            result.push({
+              label: 'Plays',
+              percentageChange: 0,
+              unit: 'number',
+              aggregation: 'latest',
+              category: 'overview',
+              data: [{ total: String(value), date: today }],
+            });
             break;
           case 'total_video_reactions_by_type_total':
           case 'post_video_likes_by_reaction_type':
-            // This returns an object with reaction types
-            if (typeof value === 'object') {
-              const totalReactions = Object.values(
+            if (typeof value === 'object' && !result.some((r) => r.label === 'Reactions')) {
+              const bd = buildBreakdown(value as Record<string, number>, 10);
+              totalReactions = Object.values(
                 value as Record<string, number>
-              ).reduce((sum: number, v: number) => sum + v, 0);
-              label = 'Reactions';
-              total = String(totalReactions);
+              ).reduce((sum: number, v: number) => sum + (Number(v) || 0), 0);
+              result.push({
+                label: 'Reactions',
+                percentageChange: 0,
+                unit: 'number',
+                aggregation: 'latest',
+                category: 'engagement',
+                breakdown: bd,
+                data: [{ total: String(totalReactions), date: today }],
+              });
             }
             break;
           case 'post_video_social_actions':
-            // This returns an object with action types (comments, shares)
             if (typeof value === 'object') {
-              const totalActions = Object.values(
+              const bd = buildBreakdown(value as Record<string, number>, 10);
+              totalActions = Object.values(
                 value as Record<string, number>
-              ).reduce((sum: number, v: number) => sum + v, 0);
-              label = 'Engagement';
-              total = String(totalActions);
+              ).reduce((sum: number, v: number) => sum + (Number(v) || 0), 0);
+              result.push({
+                label: 'Engagement',
+                percentageChange: 0,
+                unit: 'number',
+                aggregation: 'latest',
+                category: 'engagement',
+                breakdown: bd,
+                data: [{ total: String(totalActions), date: today }],
+              });
+              const obj = value as Record<string, number>;
+              if (obj.COMMENT !== undefined || obj.comment !== undefined) {
+                result.push({
+                  label: 'Comments',
+                  percentageChange: 0,
+                  unit: 'number',
+                  aggregation: 'latest',
+                  category: 'engagement',
+                  data: [
+                    {
+                      total: String(Number(obj.COMMENT ?? obj.comment) || 0),
+                      date: today,
+                    },
+                  ],
+                });
+              }
+              if (obj.SHARE !== undefined || obj.share !== undefined) {
+                result.push({
+                  label: 'Shares',
+                  percentageChange: 0,
+                  unit: 'number',
+                  aggregation: 'latest',
+                  category: 'engagement',
+                  data: [
+                    {
+                      total: String(Number(obj.SHARE ?? obj.share) || 0),
+                      date: today,
+                    },
+                  ],
+                });
+              }
+            }
+            break;
+          case 'total_video_avg_time_watched':
+          case 'fb_reels_avg_watch_time':
+            if (
+              typeof value === 'number' &&
+              value > 0 &&
+              !result.some((r) => r.label === 'Average Watch Time')
+            ) {
+              result.push({
+                label: 'Average Watch Time',
+                percentageChange: 0,
+                unit: 'seconds',
+                aggregation: 'latest',
+                category: 'retention',
+                data: [
+                  {
+                    total: String(Number((value / 1000).toFixed(2))),
+                    date: today,
+                  },
+                ],
+              });
+            }
+            break;
+          case 'total_video_view_total_time':
+            if (typeof value === 'number' && value > 0) {
+              result.push({
+                label: 'Total Watch Time',
+                percentageChange: 0,
+                unit: 'minutes',
+                aggregation: 'latest',
+                category: 'retention',
+                data: [
+                  {
+                    total: String(Number((value / 60000).toFixed(2))),
+                    date: today,
+                  },
+                ],
+              });
             }
             break;
         }
+      }
 
-        if (label) {
-          result.push({
-            label,
-            percentageChange: 0,
-            data: [{ total, date: today }],
-          });
-        }
+      if (playsOrViews > 0 && (totalReactions > 0 || totalActions > 0)) {
+        result.push({
+          label: 'Engagement Rate',
+          percentageChange: 0,
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          data: [
+            {
+              total: String(
+                Number(
+                  (((totalReactions + totalActions) / playsOrViews) * 100).toFixed(
+                    2
+                  )
+                )
+              ),
+              date: today,
+            },
+          ],
+        });
       }
 
       return result;
     } catch (err) {
+      if (err instanceof RefreshToken || err instanceof Disconnect) {
+        throw err;
+      }
       console.error('Error fetching Facebook video post analytics:', err);
       return [];
     }

@@ -17,17 +17,33 @@ export class AnalyticsController {
   async getIntegration(
     @GetOrgFromRequest() org: Organization,
     @Param('integration') integration: string,
-    @Query('date') date: string
+    @Query('date') date: string,
+    @Query('refresh') refresh?: string
   ) {
-    return this._integrationService.checkAnalytics(org, integration, date);
+    const skipCache = refresh === 'true' || refresh === '1';
+    return this._integrationService.checkAnalytics(
+      org,
+      integration,
+      date,
+      false,
+      skipCache
+    );
   }
 
   @Get('/post/:postId')
   async getPostAnalytics(
     @GetOrgFromRequest() org: Organization,
     @Param('postId') postId: string,
-    @Query('date') date: string
+    @Query('date') date: string,
+    @Query('refresh') refresh?: string
   ) {
-    return this._postsService.checkPostAnalytics(org.id, postId, +date);
+    const skipCache = refresh === 'true' || refresh === '1';
+    return this._postsService.checkPostAnalytics(
+      org.id,
+      postId,
+      +date,
+      false,
+      skipCache
+    );
   }
 }

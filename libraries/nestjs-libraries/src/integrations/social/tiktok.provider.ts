@@ -1,5 +1,6 @@
 import {
   AnalyticsData,
+  AnalyticsPostItem,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -16,6 +17,12 @@ import {
   ValidityMedia,
   rangeReadFailure,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  computePercentageChange,
+  mergeDailyPoints,
+  safeAnalyticsCall,
+  summarizePostTitle,
+} from '@gitroom/nestjs-libraries/integrations/social/analytics.helper';
 import { TikTokDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/tiktok.dto';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { setHeartbeatDetails } from '@gitroom/nestjs-libraries/temporal/temporal.heartbeat';
@@ -1037,15 +1044,155 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
     );
   }
 
+  private throwIfTiktokOpenAuthError(body: any, status?: number) {
+    const asString = JSON.stringify(body || {});
+    const handleError = this.handleErrors(asString);
+    if (status === 401 || handleError?.type === 'refresh-token') {
+      throw new RefreshToken(
+        this.identifier,
+        asString,
+        '{}',
+        handleError?.value || 'Access token invalid'
+      );
+    }
+    if (handleError?.type === 'disconnect') {
+      throw new Disconnect(
+        this.identifier,
+        asString,
+        '{}',
+        handleError.value
+      );
+    }
+  }
+
+  private async fetchTiktokOpenVideos(
+    accessToken: string,
+    stopBeforeUnix: number,
+    maxPages = 5
+  ): Promise<any[]> {
+    const allVideos: any[] = [];
+    let cursor: number | string | undefined = undefined;
+    const fullFields =
+      'id,title,video_description,create_time,cover_image_url,share_url,duration,view_count,like_count,comment_count,share_count';
+    let useMinimalList = false;
+
+    for (let page = 0; page < maxPages; page++) {
+      const fields = useMinimalList
+        ? 'id,title,video_description,create_time,cover_image_url,share_url,duration'
+        : fullFields;
+      const bodyPayload: Record<string, any> = { max_count: 20 };
+      if (cursor !== undefined && cursor !== null) {
+        bodyPayload.cursor = cursor;
+      }
+
+      const res = await fetch(
+        `https://open.tiktokapis.com/v2/video/list/?fields=${fields}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify(bodyPayload),
+        }
+      );
+
+      const json = await res.json();
+      this.throwIfTiktokOpenAuthError(json, res.status);
+
+      if (
+        json?.error?.code &&
+        json.error.code !== 'ok' &&
+        !useMinimalList &&
+        page === 0
+      ) {
+        useMinimalList = true;
+        page -= 1;
+        continue;
+      }
+
+      const batch: any[] = json?.data?.videos || [];
+      if (!batch.length) {
+        break;
+      }
+
+      allVideos.push(...batch);
+
+      const oldestInBatch = batch.reduce((min, v) => {
+        const ts = Number(v.create_time) || 0;
+        return ts > 0 && ts < min ? ts : min;
+      }, Number.MAX_SAFE_INTEGER);
+
+      if (
+        !json?.data?.has_more ||
+        json?.data?.cursor === undefined ||
+        (oldestInBatch < Number.MAX_SAFE_INTEGER &&
+          oldestInBatch < stopBeforeUnix)
+      ) {
+        break;
+      }
+      cursor = json.data.cursor;
+    }
+
+    const needsMetrics = allVideos.filter((v) => v.view_count === undefined);
+    if (needsMetrics.length > 0) {
+      await safeAnalyticsCall(
+        'tiktok.video.query.enrich',
+        async () => {
+          const statsById = new Map<string, any>();
+          for (let i = 0; i < needsMetrics.length; i += 20) {
+            const ids = needsMetrics
+              .slice(i, i + 20)
+              .map((v) => String(v.id))
+              .filter(Boolean);
+            if (!ids.length) continue;
+            const qRes = await fetch(
+              'https://open.tiktokapis.com/v2/video/query/?fields=id,like_count,comment_count,share_count,view_count',
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${accessToken}`,
+                },
+                body: JSON.stringify({ filters: { video_ids: ids } }),
+              }
+            );
+            const qJson = await qRes.json();
+            this.throwIfTiktokOpenAuthError(qJson, qRes.status);
+            for (const item of qJson?.data?.videos || []) {
+              if (item?.id) {
+                statsById.set(String(item.id), item);
+              }
+            }
+          }
+          for (const v of allVideos) {
+            const st = statsById.get(String(v.id));
+            if (st) {
+              Object.assign(v, st);
+            }
+          }
+        },
+        undefined
+      );
+    }
+
+    return allVideos;
+  }
+
   async analytics(
     id: string,
     accessToken: string,
     date: number
   ): Promise<AnalyticsData[]> {
+    const safeDays = Math.max(1, Math.min(365, Math.floor(date || 7)));
     const today = dayjs().format('YYYY-MM-DD');
+    const sinceUnix = dayjs().subtract(safeDays, 'day').startOf('day').unix();
+    const prevSinceUnix = dayjs()
+      .subtract(safeDays * 2, 'day')
+      .startOf('day')
+      .unix();
 
     try {
-      // Get user stats (follower_count, following_count, likes_count, video_count)
       const userStatsResponse = await fetch(
         'https://open.tiktokapis.com/v2/user/info/?fields=follower_count,following_count,likes_count,video_count',
         {
@@ -1057,6 +1204,7 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
       );
 
       const userStatsData = await userStatsResponse.json();
+      this.throwIfTiktokOpenAuthError(userStatsData, userStatsResponse.status);
       const userStats = userStatsData?.data?.user;
 
       const result: AnalyticsData[] = [];
@@ -1066,6 +1214,8 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
           result.push({
             label: 'Followers',
             percentageChange: 0,
+            aggregation: 'latest',
+            category: 'overview',
             data: [{ total: String(userStats.follower_count), date: today }],
           });
         }
@@ -1074,6 +1224,8 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
           result.push({
             label: 'Following',
             percentageChange: 0,
+            aggregation: 'latest',
+            category: 'audience',
             data: [{ total: String(userStats.following_count), date: today }],
           });
         }
@@ -1082,6 +1234,8 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
           result.push({
             label: 'Total Likes',
             percentageChange: 0,
+            aggregation: 'latest',
+            category: 'engagement',
             data: [{ total: String(userStats.likes_count), date: today }],
           });
         }
@@ -1090,89 +1244,249 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
           result.push({
             label: 'Videos',
             percentageChange: 0,
+            aggregation: 'latest',
+            category: 'overview',
             data: [{ total: String(userStats.video_count), date: today }],
           });
         }
       }
 
-      // Get recent videos and aggregate their stats
-      const videoListResponse = await fetch(
-        'https://open.tiktokapis.com/v2/video/list/?fields=id',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify({ max_count: 20 }),
-        }
+      const allVideos = await safeAnalyticsCall(
+        'tiktok.video.list',
+        () => this.fetchTiktokOpenVideos(accessToken, prevSinceUnix, 5),
+        []
       );
 
-      const videoListData = await videoListResponse.json();
-      const videos = videoListData?.data?.videos;
+      if (allVideos.length > 0) {
+        const hasTimestamps = allVideos.some((v) => Number(v.create_time) > 0);
+        const windowVideos = hasTimestamps
+          ? allVideos.filter((v) => Number(v.create_time) >= sinceUnix)
+          : allVideos;
+        const prevWindowVideos = hasTimestamps
+          ? allVideos.filter(
+              (v) =>
+                Number(v.create_time) >= prevSinceUnix &&
+                Number(v.create_time) < sinceUnix
+            )
+          : [];
 
-      if (videos && videos.length > 0) {
-        const videoIds = videos.map((v: { id: string }) => v.id);
+        const usingFallbackLatest =
+          hasTimestamps && windowVideos.length === 0 && allVideos.length > 0;
+        const activeVideos = usingFallbackLatest
+          ? allVideos.slice(0, 20)
+          : windowVideos;
+        const fallbackNote = usingFallbackLatest
+          ? `No new videos published in the last ${safeDays} days; showing latest ${activeVideos.length} videos`
+          : undefined;
 
-        // Query video details to get engagement metrics
-        const videoQueryResponse = await fetch(
-          'https://open.tiktokapis.com/v2/video/query/?fields=id,like_count,comment_count,share_count,view_count',
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${accessToken}`,
+        const sumStats = (list: any[]) =>
+          list.reduce(
+            (acc, v) => {
+              acc.views += Number(v.view_count) || 0;
+              acc.likes += Number(v.like_count) || 0;
+              acc.comments += Number(v.comment_count) || 0;
+              acc.shares += Number(v.share_count) || 0;
+              return acc;
             },
-            body: JSON.stringify({
-              filters: { video_ids: videoIds },
-            }),
+            { views: 0, likes: 0, comments: 0, shares: 0 }
+          );
+
+        const currTotals = sumStats(activeVideos);
+        const prevTotals =
+          !usingFallbackLatest && prevWindowVideos.length > 0
+            ? sumStats(prevWindowVideos)
+            : undefined;
+
+        const groupDaily = (list: any[], field: string) => {
+          if (!list.length || usingFallbackLatest || !hasTimestamps) {
+            return null;
           }
-        );
-
-        const videoQueryData = await videoQueryResponse.json();
-        const videoDetails = videoQueryData?.data?.videos;
-
-        if (videoDetails && videoDetails.length > 0) {
-          let totalViews = 0;
-          let totalLikes = 0;
-          let totalComments = 0;
-          let totalShares = 0;
-
-          for (const video of videoDetails) {
-            totalViews += video.view_count || 0;
-            totalLikes += video.like_count || 0;
-            totalComments += video.comment_count || 0;
-            totalShares += video.share_count || 0;
+          const map = new Map<string, number>();
+          for (const v of list) {
+            const ts = Number(v.create_time) || 0;
+            if (!ts) continue;
+            const d = dayjs.unix(ts).format('YYYY-MM-DD');
+            map.set(d, (map.get(d) || 0) + (Number(v[field]) || 0));
           }
+          const pts = mergeDailyPoints(
+            Array.from(map.entries()).map(([d, total]) => ({
+              date: d,
+              total,
+            }))
+          );
+          return pts.length > 0 ? pts : null;
+        };
 
-          result.push({
-            label: 'Views',
-            percentageChange: 0,
-            data: [{ total: String(totalViews), date: today }],
+        result.push({
+          label: 'Views',
+          percentageChange: computePercentageChange(
+            currTotals.views,
+            prevTotals?.views
+          ),
+          aggregation: 'sum',
+          category: 'overview',
+          note: fallbackNote,
+          data: groupDaily(activeVideos, 'view_count') || [
+            { total: String(currTotals.views), date: today },
+          ],
+        });
+
+        result.push({
+          label: 'Videos in Period',
+          percentageChange: hasTimestamps
+            ? computePercentageChange(
+                windowVideos.length,
+                prevWindowVideos.length || undefined
+              )
+            : 0,
+          aggregation: 'latest',
+          category: 'overview',
+          data: [{ total: String(windowVideos.length), date: today }],
+        });
+
+        const avgViews =
+          activeVideos.length > 0
+            ? Math.round(currTotals.views / activeVideos.length)
+            : 0;
+        const prevAvgViews =
+          prevTotals && prevWindowVideos.length > 0
+            ? Math.round(prevTotals.views / prevWindowVideos.length)
+            : undefined;
+
+        result.push({
+          label: 'Average Views per Video',
+          percentageChange: computePercentageChange(avgViews, prevAvgViews),
+          aggregation: 'latest',
+          category: 'overview',
+          note: fallbackNote,
+          data: [{ total: String(avgViews), date: today }],
+        });
+
+        result.push({
+          label: 'Recent Likes',
+          percentageChange: computePercentageChange(
+            currTotals.likes,
+            prevTotals?.likes
+          ),
+          aggregation: 'sum',
+          category: 'engagement',
+          note: fallbackNote,
+          data: groupDaily(activeVideos, 'like_count') || [
+            { total: String(currTotals.likes), date: today },
+          ],
+        });
+
+        result.push({
+          label: 'Recent Comments',
+          percentageChange: computePercentageChange(
+            currTotals.comments,
+            prevTotals?.comments
+          ),
+          aggregation: 'sum',
+          category: 'engagement',
+          note: fallbackNote,
+          data: groupDaily(activeVideos, 'comment_count') || [
+            { total: String(currTotals.comments), date: today },
+          ],
+        });
+
+        result.push({
+          label: 'Recent Shares',
+          percentageChange: computePercentageChange(
+            currTotals.shares,
+            prevTotals?.shares
+          ),
+          aggregation: 'sum',
+          category: 'engagement',
+          note: fallbackNote,
+          data: groupDaily(activeVideos, 'share_count') || [
+            { total: String(currTotals.shares), date: today },
+          ],
+        });
+
+        const currInteractions =
+          currTotals.likes + currTotals.comments + currTotals.shares;
+        const currEr =
+          currTotals.views > 0
+            ? Number(((currInteractions / currTotals.views) * 100).toFixed(2))
+            : 0;
+        const prevEr =
+          prevTotals && prevTotals.views > 0
+            ? Number(
+                (
+                  ((prevTotals.likes +
+                    prevTotals.comments +
+                    prevTotals.shares) /
+                    prevTotals.views) *
+                  100
+                ).toFixed(2)
+              )
+            : undefined;
+
+        result.push({
+          label: 'Engagement Rate',
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          note: fallbackNote,
+          percentageChange: computePercentageChange(currEr, prevEr, true),
+          data: [{ total: String(currEr), date: today }],
+        });
+
+        const postItems: AnalyticsPostItem[] = activeVideos
+          .slice(0, 15)
+          .map((v) => {
+            const views = Number(v.view_count) || 0;
+            const likes = Number(v.like_count) || 0;
+            const comments = Number(v.comment_count) || 0;
+            const shares = Number(v.share_count) || 0;
+            const er =
+              views > 0
+                ? Number(
+                    (((likes + comments + shares) / views) * 100).toFixed(2)
+                  )
+                : 0;
+            const pubIso =
+              Number(v.create_time) > 0
+                ? dayjs.unix(Number(v.create_time)).toISOString()
+                : today;
+
+            return {
+              id: String(v.id),
+              title: summarizePostTitle(
+                v.title || v.video_description,
+                `TikTok ${v.id}`
+              ),
+              url: v.share_url ? String(v.share_url).split('?')[0] : undefined,
+              thumbnail: v.cover_image_url || undefined,
+              publishedAt: pubIso,
+              mediaType: 'VIDEO',
+              views,
+              likes,
+              comments,
+              shares,
+              engagementRate: er,
+            };
           });
 
+        if (postItems.length > 0) {
           result.push({
-            label: 'Recent Likes',
+            label: 'Recent Posts Performance',
             percentageChange: 0,
-            data: [{ total: String(totalLikes), date: today }],
-          });
-
-          result.push({
-            label: 'Recent Comments',
-            percentageChange: 0,
-            data: [{ total: String(totalComments), date: today }],
-          });
-
-          result.push({
-            label: 'Recent Shares',
-            percentageChange: 0,
-            data: [{ total: String(totalShares), date: today }],
+            category: 'posts',
+            note: fallbackNote,
+            posts: postItems,
+            data: [{ total: String(currTotals.views), date: today }],
           });
         }
       }
 
       return result;
     } catch (err) {
+      if (err instanceof RefreshToken || err instanceof Disconnect) {
+        throw err;
+      }
       console.error('Error fetching TikTok analytics:', err);
       return [];
     }
@@ -1305,24 +1619,36 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
     const today = dayjs().format('YYYY-MM-DD');
 
     try {
-      // Query video details using the video ID
-      const response = await fetch(
-        'https://open.tiktokapis.com/v2/video/query/?fields=id,like_count,comment_count,share_count,view_count',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${accessToken}`,
-          },
-          body: JSON.stringify({
-            filters: {
-              video_ids: [postId],
+      const queryVideo = async (fields: string) => {
+        const response = await fetch(
+          `https://open.tiktokapis.com/v2/video/query/?fields=${fields}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${accessToken}`,
             },
-          }),
-        }
-      );
+            body: JSON.stringify({
+              filters: {
+                video_ids: [postId],
+              },
+            }),
+          }
+        );
+        const data = await response.json();
+        this.throwIfTiktokOpenAuthError(data, response.status);
+        return data;
+      };
 
-      const data = await response.json();
+      let data = await queryVideo(
+        'id,title,video_description,duration,create_time,share_url,like_count,comment_count,share_count,view_count'
+      );
+      if (data?.error?.code && data.error.code !== 'ok') {
+        data = await queryVideo(
+          'id,like_count,comment_count,share_count,view_count'
+        );
+      }
+
       const video = data?.data?.videos?.[0];
 
       if (!video) {
@@ -1330,11 +1656,18 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
       }
 
       const result: AnalyticsData[] = [];
+      const views = Number(video.view_count) || 0;
+      const likes = Number(video.like_count) || 0;
+      const comments = Number(video.comment_count) || 0;
+      const shares = Number(video.share_count) || 0;
+      const totalInteractions = likes + comments + shares;
 
       if (video.view_count !== undefined) {
         result.push({
           label: 'Views',
           percentageChange: 0,
+          aggregation: 'latest',
+          category: 'overview',
           data: [{ total: String(video.view_count), date: today }],
         });
       }
@@ -1343,6 +1676,8 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
         result.push({
           label: 'Likes',
           percentageChange: 0,
+          aggregation: 'latest',
+          category: 'engagement',
           data: [{ total: String(video.like_count), date: today }],
         });
       }
@@ -1351,6 +1686,8 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
         result.push({
           label: 'Comments',
           percentageChange: 0,
+          aggregation: 'latest',
+          category: 'engagement',
           data: [{ total: String(video.comment_count), date: today }],
         });
       }
@@ -1359,12 +1696,49 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
         result.push({
           label: 'Shares',
           percentageChange: 0,
+          aggregation: 'latest',
+          category: 'engagement',
           data: [{ total: String(video.share_count), date: today }],
+        });
+      }
+
+      result.push({
+        label: 'Total Interactions',
+        percentageChange: 0,
+        aggregation: 'latest',
+        category: 'engagement',
+        data: [{ total: String(totalInteractions), date: today }],
+      });
+
+      if (views > 0) {
+        const er = Number(((totalInteractions / views) * 100).toFixed(2));
+        result.push({
+          label: 'Engagement Rate',
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          percentageChange: 0,
+          data: [{ total: String(er), date: today }],
+        });
+      }
+
+      if (Number(video.duration) > 0) {
+        result.push({
+          label: 'Video Duration',
+          unit: 'seconds',
+          aggregation: 'latest',
+          category: 'retention',
+          percentageChange: 0,
+          data: [{ total: String(Number(video.duration)), date: today }],
         });
       }
 
       return result;
     } catch (err) {
+      if (err instanceof RefreshToken || err instanceof Disconnect) {
+        throw err;
+      }
       console.error('Error fetching TikTok post analytics:', err);
       return [];
     }

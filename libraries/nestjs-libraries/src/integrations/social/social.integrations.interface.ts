@@ -67,10 +67,47 @@ export interface IAuthenticator {
   ): Promise<{ id: string; url: string }[]>;
 }
 
+export interface AnalyticsBreakdownItem {
+  label: string;
+  value: number;
+  percentage?: number;
+}
+
+export interface AnalyticsPostItem {
+  id: string;
+  title: string;
+  url?: string;
+  thumbnail?: string;
+  publishedAt: string;
+  mediaType?: string;
+  views?: number;
+  reach?: number;
+  likes?: number;
+  comments?: number;
+  shares?: number;
+  saves?: number;
+  engagementRate?: number;
+  avgWatchTimeSeconds?: number;
+}
+
 export interface AnalyticsData {
   label: string;
   data: Array<{ total: string; date: string }>;
   percentageChange: number;
+  average?: boolean;
+  unit?: 'number' | 'percent' | 'seconds' | 'minutes';
+  aggregation?: 'sum' | 'average' | 'latest';
+  category?:
+    | 'overview'
+    | 'engagement'
+    | 'retention'
+    | 'audience'
+    | 'traffic'
+    | 'posts';
+  breakdown?: AnalyticsBreakdownItem[];
+  posts?: AnalyticsPostItem[];
+  note?: string;
+  updatedAt?: string;
 }
 
 

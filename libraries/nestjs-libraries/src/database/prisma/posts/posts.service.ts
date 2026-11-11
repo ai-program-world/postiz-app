@@ -316,8 +316,10 @@ export class PostsService {
     orgId: string,
     postId: string,
     date: number,
-    forceRefresh = false
+    forceRefresh = false,
+    skipCache = false
   ): Promise<AnalyticsData[] | { missing: true }> {
+    const days = Number(date) > 0 ? Number(date) : 7;
     const post = await this._postRepository.getPostById(postId, orgId);
     if (!post || !post.releaseId) {
       return [];
@@ -362,35 +364,49 @@ export class PostsService {
       }
     }
 
-    // const getIntegrationData = await ioRedis.get(
-    //   `integration:${orgId}:${post.id}:${date}`
-    // );
-    // if (getIntegrationData) {
-    //   return JSON.parse(getIntegrationData);
-    // }
+    const cacheKey = `integration:${orgId}:${post.id}:${days}`;
+    if (!skipCache) {
+      const getIntegrationData = await ioRedis.get(cacheKey);
+      if (getIntegrationData) {
+        return JSON.parse(getIntegrationData);
+      }
+    }
 
     try {
       const { releaseId } = await this.resolveRelease(orgId, post);
 
-      const loadAnalytics = await integrationProvider.postAnalytics(
+      const rawAnalytics = await integrationProvider.postAnalytics(
         getIntegration.internalId,
         getIntegration.token,
         releaseId,
-        date
+        days
       );
-      await ioRedis.set(
-        `integration:${orgId}:${post.id}:${date}`,
-        JSON.stringify(loadAnalytics),
-        'EX',
-        !process.env.NODE_ENV || process.env.NODE_ENV === 'development'
-          ? 1
-          : 3600
-      );
+      const updatedAt = new Date().toISOString();
+      const loadAnalytics = (rawAnalytics || []).map((item) => ({
+        ...item,
+        updatedAt: item.updatedAt || updatedAt,
+      }));
+      if (loadAnalytics.length > 0) {
+        await ioRedis.set(
+          cacheKey,
+          JSON.stringify(loadAnalytics),
+          'EX',
+          !process.env.NODE_ENV || process.env.NODE_ENV === 'development'
+            ? 1
+            : 3600
+        );
+      }
       return loadAnalytics;
     } catch (e) {
       // Retry once with a refreshed token
       if (e instanceof RefreshToken && !forceRefresh) {
-        return this.checkPostAnalytics(orgId, postId, date, true);
+        return this.checkPostAnalytics(
+          orgId,
+          postId,
+          days,
+          true,
+          skipCache
+        );
       }
       console.log(e);
     }

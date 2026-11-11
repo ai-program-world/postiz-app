@@ -1,5 +1,6 @@
 import {
   AnalyticsData,
+  AnalyticsPostItem,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -11,8 +12,21 @@ import { timer } from '@gitroom/helpers/utils/timer';
 import dayjs from 'dayjs';
 import {
   BadBody,
+  Disconnect,
+  RefreshToken,
   SocialAbstract,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  aggregatePoints,
+  buildBreakdown,
+  computePercentageChange,
+  computeSeriesTrend,
+  mergeDailyPoints,
+  previousDateWindows,
+  safeAnalyticsCall,
+  splitDateWindows,
+  summarizePostTitle,
+} from '@gitroom/nestjs-libraries/integrations/social/analytics.helper';
 import { capitalize, chunk } from 'lodash';
 import { Plug } from '@gitroom/helpers/decorators/plug.decorator';
 import { Integration } from '@prisma/client';
@@ -731,32 +745,355 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     ];
   }
 
+  private async fetchThreadsJson(url: string): Promise<any> {
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json?.error) {
+      if (json.error.code === 190) {
+        throw new RefreshToken(this.identifier, JSON.stringify(json), '{}');
+      }
+      throw new Error(json.error.message || 'Threads API error');
+    }
+    return json;
+  }
+
   async analytics(
     id: string,
     accessToken: string,
     date: number
   ): Promise<AnalyticsData[]> {
-    const until = dayjs().endOf('day').unix();
-    const since = dayjs().subtract(date, 'day').unix();
+    const today = dayjs().format('YYYY-MM-DD');
+    const windows = splitDateWindows(date, 28);
+    const prevWindows = date <= 30 ? previousDateWindows(date, 28) : [];
+    const result: AnalyticsData[] = [];
 
-    const { data, ...all } = await (
-      await fetch(
-        `https://graph.threads.net/v1.0/${id}/threads_insights?metric=views,likes,replies,reposts,quotes&access_token=${accessToken}&period=day&since=${since}&until=${until}`
-      )
-    ).json();
-
-    return (
-      data?.map((d: any) => ({
-        label: capitalize(d.name),
-        percentageChange: 5,
-        data: d.total_value
-          ? [{ total: d.total_value.value, date: dayjs().format('YYYY-MM-DD') }]
-          : d.values.map((v: any) => ({
-              total: v.value,
-              date: dayjs(v.end_time).format('YYYY-MM-DD'),
-            })),
-      })) || []
+    // 1. Followers snapshot
+    const followersCount = await safeAnalyticsCall<number | undefined>(
+      'threads.followers_count',
+      async () => {
+        const res = await this.fetchThreadsJson(
+          `https://graph.threads.net/v1.0/${id}/threads_insights?metric=followers_count&access_token=${accessToken}`
+        );
+        const item = res?.data?.find((d: any) => d.name === 'followers_count');
+        const val = item?.total_value?.value ?? item?.values?.[0]?.value;
+        return val !== undefined ? Number(val) : undefined;
+      },
+      undefined
     );
+
+    if (followersCount !== undefined) {
+      result.push({
+        label: 'Followers',
+        percentageChange: 0,
+        aggregation: 'latest',
+        unit: 'number',
+        category: 'overview',
+        data: [{ total: String(followersCount), date: today }],
+      });
+    }
+
+    // 2. Chunked core metrics (views time-series + likes/replies/reposts/quotes totals)
+    const fetchWindowMetrics = async (winList = windows) => {
+      const viewsRaw: Array<{ date: string; total: number }> = [];
+      const totals: Record<string, number> = {};
+
+      for (const w of winList) {
+        const res = await this.fetchThreadsJson(
+          `https://graph.threads.net/v1.0/${id}/threads_insights?metric=views,likes,replies,reposts,quotes&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+        );
+        for (const d of res?.data || []) {
+          if (Array.isArray(d.values) && d.values.length > 0) {
+            for (const v of d.values) {
+              viewsRaw.push({
+                date: dayjs(v.end_time).format('YYYY-MM-DD'),
+                total: Number(v.value) || 0,
+              });
+            }
+          } else if (d.total_value?.value !== undefined) {
+            totals[d.name] =
+              (totals[d.name] || 0) + (Number(d.total_value.value) || 0);
+          }
+        }
+      }
+      return { viewsPoints: mergeDailyPoints(viewsRaw), totals };
+    };
+
+    const [currentCore, prevCore, clicksTotal] = await Promise.all([
+      safeAnalyticsCall(
+        'threads.core',
+        () => fetchWindowMetrics(windows),
+        { viewsPoints: [], totals: {} as Record<string, number> }
+      ),
+      prevWindows.length > 0
+        ? safeAnalyticsCall(
+            'threads.core.prev',
+            () => fetchWindowMetrics(prevWindows),
+            { viewsPoints: [], totals: {} as Record<string, number> }
+          )
+        : Promise.resolve({
+            viewsPoints: [],
+            totals: {} as Record<string, number>,
+          }),
+      safeAnalyticsCall<number | undefined>(
+        'threads.clicks',
+        async () => {
+          let sum = 0;
+          let found = false;
+          for (const w of windows) {
+            const res = await this.fetchThreadsJson(
+              `https://graph.threads.net/v1.0/${id}/threads_insights?metric=clicks&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+            );
+            const d = res?.data?.[0];
+            if (d?.total_value?.value !== undefined) {
+              sum += Number(d.total_value.value) || 0;
+              found = true;
+            } else if (Array.isArray(d?.values)) {
+              for (const v of d.values) sum += Number(v.value) || 0;
+              found = true;
+            }
+          }
+          return found ? sum : undefined;
+        },
+        undefined
+      ),
+    ]);
+
+    const viewsSum =
+      currentCore.viewsPoints.length > 0
+        ? aggregatePoints(currentCore.viewsPoints, 'sum')
+        : currentCore.totals.views || 0;
+    const prevViewsSum =
+      prevCore.viewsPoints.length > 0
+        ? aggregatePoints(prevCore.viewsPoints, 'sum')
+        : prevCore.totals.views;
+
+    if (currentCore.viewsPoints.length > 0) {
+      result.push({
+        label: 'Views',
+        percentageChange:
+          prevViewsSum !== undefined && prevViewsSum > 0
+            ? computePercentageChange(viewsSum, prevViewsSum)
+            : computeSeriesTrend(currentCore.viewsPoints, 'sum'),
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'overview',
+        data: currentCore.viewsPoints,
+      });
+    } else if (currentCore.totals.views !== undefined) {
+      result.push({
+        label: 'Views',
+        percentageChange: computePercentageChange(
+          currentCore.totals.views,
+          prevCore.totals.views
+        ),
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'overview',
+        data: [{ total: String(currentCore.totals.views), date: today }],
+      });
+    }
+
+    for (const metricName of ['likes', 'replies', 'reposts', 'quotes']) {
+      const val = currentCore.totals[metricName];
+      if (val === undefined) continue;
+      result.push({
+        label: capitalize(metricName),
+        percentageChange: computePercentageChange(
+          val,
+          prevCore.totals[metricName]
+        ),
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'engagement',
+        data: [{ total: String(val), date: today }],
+      });
+    }
+
+    if (clicksTotal !== undefined) {
+      result.push({
+        label: 'Clicks',
+        percentageChange: 0,
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'traffic',
+        data: [{ total: String(clicksTotal), date: today }],
+      });
+    }
+
+    const totalInteractions =
+      (currentCore.totals.likes || 0) +
+      (currentCore.totals.replies || 0) +
+      (currentCore.totals.reposts || 0) +
+      (currentCore.totals.quotes || 0);
+    const prevInteractions =
+      (prevCore.totals.likes || 0) +
+      (prevCore.totals.replies || 0) +
+      (prevCore.totals.reposts || 0) +
+      (prevCore.totals.quotes || 0);
+
+    if (
+      currentCore.totals.likes !== undefined ||
+      currentCore.totals.replies !== undefined
+    ) {
+      result.push({
+        label: 'Total Interactions',
+        percentageChange:
+          prevWindows.length > 0
+            ? computePercentageChange(totalInteractions, prevInteractions)
+            : 0,
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'engagement',
+        data: [{ total: String(totalInteractions), date: today }],
+      });
+
+      if (viewsSum > 0) {
+        const engRate = Number(((totalInteractions / viewsSum) * 100).toFixed(2));
+        const prevEngRate =
+          prevViewsSum && prevViewsSum > 0
+            ? (prevInteractions / prevViewsSum) * 100
+            : undefined;
+        result.push({
+          label: 'Engagement Rate',
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          percentageChange: computePercentageChange(
+            engRate,
+            prevEngRate,
+            true
+          ),
+          data: [{ total: String(engRate), date: today }],
+        });
+      }
+    }
+
+    // 3. Follower demographics (country, city, age, gender; requires >= 100 followers)
+    const fetchThreadsDemo = async (
+      breakdown: 'country' | 'city' | 'age' | 'gender'
+    ): Promise<Record<string, number>> => {
+      const res = await this.fetchThreadsJson(
+        `https://graph.threads.net/v1.0/${id}/threads_insights?metric=follower_demographics&breakdown=${breakdown}&access_token=${accessToken}`
+      );
+      const results =
+        res?.data?.[0]?.total_value?.breakdowns?.[0]?.results || [];
+      const map: Record<string, number> = {};
+      for (const row of results) {
+        const dim = (row.dimension_values || []).join(' ');
+        if (!dim) continue;
+        map[dim] = (map[dim] || 0) + (Number(row.value) || 0);
+      }
+      return map;
+    };
+
+    const [countryMap, cityMap, ageMap, genderMap] = await Promise.all([
+      safeAnalyticsCall(
+        'threads.demo.country',
+        () => fetchThreadsDemo('country'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'threads.demo.city',
+        () => fetchThreadsDemo('city'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'threads.demo.age',
+        () => fetchThreadsDemo('age'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'threads.demo.gender',
+        () => fetchThreadsDemo('gender'),
+        {} as Record<string, number>
+      ),
+    ]);
+
+    const addDemoCard = (title: string, raw: Record<string, number>, limit = 10) => {
+      const bd = buildBreakdown(raw, limit);
+      if (bd.length > 0) {
+        const sum = bd.reduce((a, b) => a + b.value, 0);
+        result.push({
+          label: title,
+          percentageChange: 0,
+          category: 'audience',
+          breakdown: bd,
+          data: [{ total: String(sum), date: today }],
+        });
+      }
+    };
+
+    addDemoCard('Audience by Country', countryMap, 10);
+    addDemoCard('Audience by City', cityMap, 10);
+    addDemoCard('Audience by Age', ageMap, 10);
+    addDemoCard('Audience by Gender', genderMap, 6);
+
+    // 4. Recent Threads Leaderboard
+    const recentThreads = await safeAnalyticsCall<AnalyticsPostItem[]>(
+      'threads.recent_posts',
+      async () => {
+        const listRes = await this.fetchThreadsJson(
+          `https://graph.threads.net/v1.0/${id}/threads?fields=id,text,media_type,permalink,thumbnail_url,media_url,timestamp&limit=12&access_token=${accessToken}`
+        );
+        const items: any[] = listRes?.data || [];
+        return Promise.all(
+          items.map(async (item) => {
+            const ins = await safeAnalyticsCall(
+              `threads.post_insight.${item.id}`,
+              () =>
+                this.fetchThreadsJson(
+                  `https://graph.threads.net/v1.0/${item.id}/insights?metric=views,likes,replies,reposts,quotes,shares&access_token=${accessToken}`
+                ),
+              null
+            );
+            const m: Record<string, number> = {};
+            for (const row of ins?.data || []) {
+              const val = row?.values?.[0]?.value ?? row?.total_value?.value;
+              if (val !== undefined) m[row.name] = Number(val) || 0;
+            }
+            const views = m.views;
+            const likes = m.likes;
+            const comments = m.replies;
+            const shares = (m.reposts || 0) + (m.quotes || 0) + (m.shares || 0);
+            const interactions = (likes || 0) + (comments || 0) + shares;
+            return {
+              id: String(item.id),
+              title: summarizePostTitle(item.text, item.media_type || 'Thread'),
+              url: item.permalink,
+              thumbnail:
+                item.thumbnail_url ||
+                (item.media_type === 'IMAGE' ? item.media_url : undefined),
+              publishedAt: item.timestamp
+                ? dayjs(item.timestamp).format('YYYY-MM-DD HH:mm')
+                : today,
+              mediaType: item.media_type,
+              views,
+              likes,
+              comments,
+              shares,
+              engagementRate:
+                views && views > 0
+                  ? Number(((interactions / views) * 100).toFixed(2))
+                  : undefined,
+            } as AnalyticsPostItem;
+          })
+        );
+      },
+      []
+    );
+
+    if (recentThreads.length > 0) {
+      result.push({
+        label: 'Recent Posts Performance',
+        percentageChange: 0,
+        category: 'posts',
+        posts: recentThreads,
+        data: [{ total: String(recentThreads.length), date: today }],
+      });
+    }
+
+    return result;
   }
 
   @Plug({
@@ -837,25 +1174,34 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     const today = dayjs().format('YYYY-MM-DD');
 
     try {
-      // Fetch thread insights from Threads API
-      const { data } = await (
-        await fetch(
+      const [coreData, sharesData] = await Promise.all([
+        this.fetchThreadsJson(
           `https://graph.threads.net/v1.0/${postId}/insights?metric=views,likes,replies,reposts,quotes&access_token=${accessToken}`
-        )
-      ).json();
+        ),
+        safeAnalyticsCall(
+          'threads.post.shares',
+          () =>
+            this.fetchThreadsJson(
+              `https://graph.threads.net/v1.0/${postId}/insights?metric=shares&access_token=${accessToken}`
+            ),
+          null
+        ),
+      ]);
 
-      if (!data || data.length === 0) {
+      const data = [...(coreData?.data || []), ...(sharesData?.data || [])];
+      if (data.length === 0) {
         return [];
       }
 
       const result: AnalyticsData[] = [];
+      const valuesMap: Record<string, number> = {};
 
       for (const metric of data) {
         const value = metric.values?.[0]?.value ?? metric.total_value?.value;
         if (value === undefined) continue;
+        valuesMap[metric.name] = Number(value) || 0;
 
         let label = '';
-
         switch (metric.name) {
           case 'views':
             label = 'Views';
@@ -872,19 +1218,62 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
           case 'quotes':
             label = 'Quotes';
             break;
+          case 'shares':
+            label = 'Shares';
+            break;
         }
 
         if (label) {
           result.push({
             label,
             percentageChange: 0,
+            unit: 'number',
+            aggregation: 'latest',
+            category: metric.name === 'views' ? 'overview' : 'engagement',
             data: [{ total: String(value), date: today }],
           });
         }
       }
 
+      const interactions =
+        (valuesMap.likes || 0) +
+        (valuesMap.replies || 0) +
+        (valuesMap.reposts || 0) +
+        (valuesMap.quotes || 0) +
+        (valuesMap.shares || 0);
+      result.push({
+        label: 'Total Interactions',
+        percentageChange: 0,
+        unit: 'number',
+        aggregation: 'latest',
+        category: 'engagement',
+        data: [{ total: String(interactions), date: today }],
+      });
+
+      if ((valuesMap.views || 0) > 0) {
+        result.push({
+          label: 'Engagement Rate',
+          percentageChange: 0,
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          data: [
+            {
+              total: String(
+                Number(((interactions / valuesMap.views) * 100).toFixed(2))
+              ),
+              date: today,
+            },
+          ],
+        });
+      }
+
       return result;
     } catch (err: any) {
+      if (err instanceof RefreshToken || err instanceof Disconnect) {
+        throw err;
+      }
       console.error(
         'Error fetching Threads post analytics:',
         err?.cause?.code || err?.message || err

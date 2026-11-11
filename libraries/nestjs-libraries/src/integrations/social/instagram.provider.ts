@@ -1,5 +1,6 @@
 import {
   AnalyticsData,
+  AnalyticsPostItem,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -12,9 +13,21 @@ import dayjs from 'dayjs';
 import {
   BadBody,
   Disconnect,
+  RefreshToken,
   SocialAbstract,
   ValidityMedia,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  aggregatePoints,
+  buildBreakdown,
+  computePercentageChange,
+  computeSeriesTrend,
+  mergeDailyPoints,
+  previousDateWindows,
+  safeAnalyticsCall,
+  splitDateWindows,
+  summarizePostTitle,
+} from '@gitroom/nestjs-libraries/integrations/social/analytics.helper';
 import { InstagramDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/instagram.dto';
 import { Integration } from '@prisma/client';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
@@ -1220,44 +1233,49 @@ export class InstagramProvider
 
   private setTitle(name: string) {
     switch (name) {
-      case 'likes': {
+      case 'likes':
         return 'Likes';
-      }
-
-      case 'followers': {
+      case 'followers':
         return 'Followers';
-      }
-
-      case 'reach': {
+      case 'reach':
         return 'Reach';
-      }
-
-      case 'follower_count': {
+      case 'follower_count':
         return 'Follower Count';
-      }
-
-      case 'views': {
+      case 'views':
         return 'Views';
-      }
-
-      case 'comments': {
+      case 'comments':
         return 'Comments';
-      }
-
-      case 'shares': {
+      case 'shares':
         return 'Shares';
-      }
-
-      case 'saves': {
+      case 'saves':
         return 'Saves';
-      }
-
-      case 'replies': {
+      case 'replies':
         return 'Replies';
-      }
+      case 'accounts_engaged':
+        return 'Accounts Engaged';
+      case 'total_interactions':
+        return 'Total Interactions';
+      case 'profile_views':
+        return 'Profile Views';
+      case 'website_clicks':
+        return 'Website Clicks';
+      case 'profile_links_taps':
+        return 'Profile Link Taps';
     }
 
     return '';
+  }
+
+  private async fetchIgJson(url: string): Promise<any> {
+    const res = await fetch(url);
+    const json = await res.json();
+    if (json?.error) {
+      if (json.error.code === 190) {
+        throw new RefreshToken(this.identifier, JSON.stringify(json), '{}');
+      }
+      throw new Error(json.error.message || 'Instagram Graph API error');
+    }
+    return json;
   }
 
   async analytics(
@@ -1266,46 +1284,520 @@ export class InstagramProvider
     date: number,
     type = 'graph.facebook.com'
   ): Promise<AnalyticsData[]> {
-    const [accessToken, userToken] = token.split('___');
-    const until = dayjs().startOf('day').unix();
-    const since = dayjs().subtract(date, 'day').unix();
+    const [accessToken] = token.split('___');
+    const today = dayjs().format('YYYY-MM-DD');
+    const windows = splitDateWindows(date, 28);
+    const prevWindows = date <= 30 ? previousDateWindows(date, 28) : [];
+    const analytics: AnalyticsData[] = [];
 
-    const { data, ...all } = await (
-      await fetch(
-        `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=follower_count,reach&access_token=${accessToken}&period=day&since=${since}&until=${until}`
-      )
-    ).json();
-
-    const { data: data2, ...all2 } = await (
-      await fetch(
-        `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric_type=total_value&metric=likes,views,comments,shares,saves,replies&access_token=${accessToken}&period=day&since=${since}&until=${until}`
-      )
-    ).json();
-    const analytics = [];
-
-    analytics.push(
-      ...(data?.map((d: any) => ({
-        label: this.setTitle(d.name),
-        percentageChange: 5,
-        data: d.values.map((v: any) => ({
-          total: v.value,
-          date: dayjs(v.end_time).format('YYYY-MM-DD'),
-        })),
-      })) || [])
+    // 1. Account overview snapshot (followers_count, media_count)
+    const profileOverview = await safeAnalyticsCall(
+      'ig.profile',
+      () =>
+        this.fetchIgJson(
+          `https://${type}/${META_GRAPH_API_VERSION}/${id}?fields=followers_count,follows_count,media_count&access_token=${accessToken}`
+        ),
+      null
     );
 
-    analytics.push(
-      ...data2.map((d: any) => ({
-        label: this.setTitle(d.name),
-        percentageChange: 5,
-        data: [
-          {
-            total: d.total_value.value,
-            date: dayjs().format('YYYY-MM-DD'),
-          },
-        ],
-      }))
+    if (profileOverview?.followers_count !== undefined) {
+      analytics.push({
+        label: 'Followers',
+        percentageChange: 0,
+        aggregation: 'latest',
+        unit: 'number',
+        category: 'overview',
+        data: [{ total: String(profileOverview.followers_count), date: today }],
+      });
+    }
+    if (profileOverview?.media_count !== undefined) {
+      analytics.push({
+        label: 'Published Media',
+        percentageChange: 0,
+        aggregation: 'latest',
+        unit: 'number',
+        category: 'overview',
+        data: [{ total: String(profileOverview.media_count), date: today }],
+      });
+    }
+
+    // 2. Daily Reach across full date range (chunked <= 28d) + prior window comparison
+    const reachPointsRaw: Array<{ date: string; total: number }> = [];
+    await safeAnalyticsCall(
+      'ig.reach',
+      async () => {
+        for (const w of windows) {
+          const res = await this.fetchIgJson(
+            `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=reach&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+          );
+          const values = res?.data?.[0]?.values || [];
+          for (const v of values) {
+            reachPointsRaw.push({
+              date: dayjs(v.end_time).format('YYYY-MM-DD'),
+              total: Number(v.value) || 0,
+            });
+          }
+        }
+      },
+      undefined
     );
+
+    let prevReachTotal: number | undefined;
+    if (prevWindows.length > 0 && reachPointsRaw.length > 0) {
+      prevReachTotal = await safeAnalyticsCall(
+        'ig.reach.prev',
+        async () => {
+          let sum = 0;
+          for (const w of prevWindows) {
+            const res = await this.fetchIgJson(
+              `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=reach&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+            );
+            for (const v of res?.data?.[0]?.values || []) {
+              sum += Number(v.value) || 0;
+            }
+          }
+          return sum;
+        },
+        undefined
+      );
+    }
+
+    const reachPoints = mergeDailyPoints(reachPointsRaw);
+    const reachSum = aggregatePoints(reachPoints, 'sum');
+    if (reachPoints.length > 0) {
+      analytics.push({
+        label: 'Reach',
+        percentageChange:
+          prevReachTotal !== undefined
+            ? computePercentageChange(reachSum, prevReachTotal)
+            : computeSeriesTrend(reachPoints, 'sum'),
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'overview',
+        data: reachPoints,
+      });
+    }
+
+    // 3. Daily Follower Count (Meta restricts follower_count to the past 30 days)
+    const followerDays = Math.min(date, 28);
+    const followerWindow = splitDateWindows(followerDays, 28)[0];
+    if (followerWindow) {
+      const followerPoints = await safeAnalyticsCall(
+        'ig.follower_count',
+        async () => {
+          const res = await this.fetchIgJson(
+            `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=follower_count&period=day&since=${followerWindow.since}&until=${followerWindow.until}&access_token=${accessToken}`
+          );
+          const values = res?.data?.[0]?.values || [];
+          return mergeDailyPoints(
+            values.map((v: any) => ({
+              date: dayjs(v.end_time).format('YYYY-MM-DD'),
+              total: Number(v.value) || 0,
+            }))
+          );
+        },
+        []
+      );
+      if (followerPoints.length > 0) {
+        analytics.push({
+          label: 'Follower Count',
+          percentageChange: computeSeriesTrend(followerPoints, 'sum'),
+          aggregation: 'sum',
+          unit: 'number',
+          category: 'overview',
+          data: followerPoints,
+        });
+      }
+    }
+
+    // 4. Period total_value metrics (chunked <= 28d and summed)
+    const sumTotalValueMetrics = async (
+      metricList: string[],
+      winList = windows
+    ): Promise<Record<string, number>> => {
+      const acc: Record<string, number> = {};
+      for (const w of winList) {
+        const res = await this.fetchIgJson(
+          `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric_type=total_value&metric=${metricList.join(
+            ','
+          )}&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+        );
+        for (const item of res?.data || []) {
+          acc[item.name] =
+            (acc[item.name] || 0) + (Number(item?.total_value?.value) || 0);
+        }
+      }
+      return acc;
+    };
+
+    const coreMetrics = [
+      'views',
+      'likes',
+      'comments',
+      'shares',
+      'saves',
+      'replies',
+    ];
+    const extendedMetrics = [
+      'accounts_engaged',
+      'total_interactions',
+      'profile_views',
+      'website_clicks',
+    ];
+
+    const [
+      coreTotals,
+      prevCoreTotals,
+      extendedTotals,
+      prevExtendedTotals,
+      linkTapsTotal,
+    ] = await Promise.all([
+      safeAnalyticsCall(
+        'ig.coreTotals',
+        () => sumTotalValueMetrics(coreMetrics),
+        {} as Record<string, number>
+      ),
+      prevWindows.length > 0
+        ? safeAnalyticsCall(
+            'ig.coreTotals.prev',
+            () => sumTotalValueMetrics(coreMetrics, prevWindows),
+            {} as Record<string, number>
+          )
+        : Promise.resolve({} as Record<string, number>),
+      safeAnalyticsCall(
+        'ig.extendedTotals',
+        () => sumTotalValueMetrics(extendedMetrics),
+        {} as Record<string, number>
+      ),
+      prevWindows.length > 0
+        ? safeAnalyticsCall(
+            'ig.extendedTotals.prev',
+            () => sumTotalValueMetrics(extendedMetrics, prevWindows),
+            {} as Record<string, number>
+          )
+        : Promise.resolve({} as Record<string, number>),
+      safeAnalyticsCall(
+        'ig.profile_links_taps',
+        () => sumTotalValueMetrics(['profile_links_taps']),
+        {} as Record<string, number>
+      ),
+    ]);
+
+    const mergedTotals = {
+      ...coreTotals,
+      ...extendedTotals,
+      ...linkTapsTotal,
+    };
+    const mergedPrevTotals = {
+      ...prevCoreTotals,
+      ...prevExtendedTotals,
+    };
+
+    for (const metricName of [
+      ...coreMetrics,
+      ...extendedMetrics,
+      'profile_links_taps',
+    ]) {
+      if (mergedTotals[metricName] === undefined) continue;
+      const label = this.setTitle(metricName);
+      if (!label) continue;
+      const val = mergedTotals[metricName];
+      const prevVal = mergedPrevTotals[metricName];
+      analytics.push({
+        label,
+        percentageChange: computePercentageChange(val, prevVal),
+        aggregation: 'sum',
+        unit: 'number',
+        category:
+          metricName === 'views' ||
+          metricName === 'profile_views' ||
+          metricName === 'website_clicks' ||
+          metricName === 'profile_links_taps'
+            ? 'overview'
+            : 'engagement',
+        data: [{ total: String(val), date: today }],
+      });
+    }
+
+    // Derived Engagement Rate
+    const totalInteractions =
+      mergedTotals.total_interactions ??
+      (mergedTotals.likes || 0) +
+        (mergedTotals.comments || 0) +
+        (mergedTotals.shares || 0) +
+        (mergedTotals.saves || 0);
+    const denominator = reachSum || mergedTotals.views || 0;
+    if (denominator > 0 && totalInteractions >= 0) {
+      const engRate = Number(((totalInteractions / denominator) * 100).toFixed(2));
+      const prevInteractions =
+        mergedPrevTotals.total_interactions ??
+        (mergedPrevTotals.likes || 0) +
+          (mergedPrevTotals.comments || 0) +
+          (mergedPrevTotals.shares || 0) +
+          (mergedPrevTotals.saves || 0);
+      const prevDenom = prevReachTotal || mergedPrevTotals.views || 0;
+      const prevEngRate =
+        prevDenom > 0 ? (prevInteractions / prevDenom) * 100 : undefined;
+
+      analytics.push({
+        label: 'Engagement Rate',
+        average: true,
+        unit: 'percent',
+        aggregation: 'latest',
+        category: 'engagement',
+        percentageChange: computePercentageChange(engRate, prevEngRate, true),
+        data: [{ total: String(engRate), date: today }],
+      });
+    }
+
+    // 5. Breakdowns & Demographics (all isolated via safeAnalyticsCall)
+    const fetchTotalBreakdown = async (
+      metric: string,
+      breakdownKey: string
+    ): Promise<Record<string, number>> => {
+      const map: Record<string, number> = {};
+      for (const w of windows) {
+        const res = await this.fetchIgJson(
+          `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=${metric}&metric_type=total_value&breakdown=${breakdownKey}&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+        );
+        const results =
+          res?.data?.[0]?.total_value?.breakdowns?.[0]?.results || [];
+        for (const row of results) {
+          const dim = (row.dimension_values || []).join(' / ');
+          if (!dim) continue;
+          map[dim] = (map[dim] || 0) + (Number(row.value) || 0);
+        }
+      }
+      return map;
+    };
+
+    const fetchDemographic = async (
+      breakdownKey: 'country' | 'city' | 'age' | 'gender'
+    ): Promise<Record<string, number>> => {
+      const res = await this.fetchIgJson(
+        `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=follower_demographics&period=lifetime&metric_type=total_value&breakdown=${breakdownKey}&access_token=${accessToken}`
+      );
+      const results =
+        res?.data?.[0]?.total_value?.breakdowns?.[0]?.results || [];
+      const map: Record<string, number> = {};
+      for (const row of results) {
+        const dim = (row.dimension_values || []).join(' ');
+        if (!dim) continue;
+        map[dim] = (map[dim] || 0) + (Number(row.value) || 0);
+      }
+      return map;
+    };
+
+    const [
+      formatViewsMap,
+      audienceTypeViewsMap,
+      followsUnfollowsMap,
+      countryMap,
+      cityMap,
+      ageMap,
+      genderMap,
+      onlineHours,
+    ] = await Promise.all([
+      safeAnalyticsCall(
+        'ig.views_by_format',
+        () => fetchTotalBreakdown('views', 'media_product_type'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'ig.views_by_follow_type',
+        () => fetchTotalBreakdown('views', 'follow_type'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'ig.follows_and_unfollows',
+        () => fetchTotalBreakdown('follows_and_unfollows', 'follow_type'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'ig.demo.country',
+        () => fetchDemographic('country'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'ig.demo.city',
+        () => fetchDemographic('city'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'ig.demo.age',
+        () => fetchDemographic('age'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'ig.demo.gender',
+        () => fetchDemographic('gender'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'ig.online_followers',
+        async () => {
+          const oUntil = dayjs().startOf('day').unix();
+          const oSince = dayjs().subtract(3, 'day').startOf('day').unix();
+          const res = await this.fetchIgJson(
+            `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=online_followers&period=lifetime&since=${oSince}&until=${oUntil}&access_token=${accessToken}`
+          );
+          const values = res?.data?.[0]?.values || [];
+          const latestObj = values[values.length - 1]?.value;
+          if (!latestObj || typeof latestObj !== 'object') return [];
+          const entries: Array<{ label: string; value: number }> = [];
+          for (let h = 0; h < 24; h++) {
+            const val = Number(latestObj[String(h)] ?? 0) || 0;
+            entries.push({
+              label: `${String(h).padStart(2, '0')}:00`,
+              value: val,
+            });
+          }
+          return buildBreakdown(entries, 24, true);
+        },
+        []
+      ),
+    ]);
+
+    const formatBreakdown = buildBreakdown(formatViewsMap, 8);
+    if (formatBreakdown.length > 0) {
+      const sum = formatBreakdown.reduce((a, b) => a + b.value, 0);
+      analytics.push({
+        label: 'Views by Format',
+        percentageChange: 0,
+        category: 'traffic',
+        breakdown: formatBreakdown,
+        data: [{ total: String(sum), date: today }],
+      });
+    }
+
+    const audienceTypeBreakdown = buildBreakdown(audienceTypeViewsMap, 6);
+    if (audienceTypeBreakdown.length > 0) {
+      const sum = audienceTypeBreakdown.reduce((a, b) => a + b.value, 0);
+      analytics.push({
+        label: 'Views by Audience Type',
+        percentageChange: 0,
+        category: 'audience',
+        breakdown: audienceTypeBreakdown,
+        data: [{ total: String(sum), date: today }],
+      });
+    }
+
+    const followBreakdown = buildBreakdown(followsUnfollowsMap, 6);
+    if (followBreakdown.length > 0) {
+      const net =
+        (followsUnfollowsMap.FOLLOWER || 0) -
+        (followsUnfollowsMap.NON_FOLLOWER || 0);
+      analytics.push({
+        label: 'Follows & Unfollows',
+        percentageChange: 0,
+        category: 'overview',
+        breakdown: followBreakdown,
+        data: [{ total: String(net), date: today }],
+      });
+    }
+
+    const addDemoCard = (title: string, rawMap: Record<string, number>, limit = 10) => {
+      const bd = buildBreakdown(rawMap, limit);
+      if (bd.length > 0) {
+        const sum = bd.reduce((a, b) => a + b.value, 0);
+        analytics.push({
+          label: title,
+          percentageChange: 0,
+          category: 'audience',
+          breakdown: bd,
+          data: [{ total: String(sum), date: today }],
+        });
+      }
+    };
+
+    addDemoCard('Audience by Country', countryMap, 10);
+    addDemoCard('Audience by City', cityMap, 10);
+    addDemoCard('Audience by Age', ageMap, 10);
+    addDemoCard('Audience by Gender', genderMap, 6);
+
+    if (onlineHours.length > 0) {
+      const peak = onlineHours.reduce(
+        (max, cur) => (cur.value > max ? cur.value : max),
+        0
+      );
+      analytics.push({
+        label: 'Active Followers by Hour',
+        percentageChange: 0,
+        category: 'audience',
+        aggregation: 'latest',
+        breakdown: onlineHours,
+        data: [{ total: String(peak), date: today }],
+      });
+    }
+
+    // 6. Recent Posts Performance Leaderboard
+    const recentPosts = await safeAnalyticsCall<AnalyticsPostItem[]>(
+      'ig.recent_posts',
+      async () => {
+        const mediaRes = await this.fetchIgJson(
+          `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?fields=id,caption,media_type,media_product_type,permalink,thumbnail_url,media_url,timestamp,like_count,comments_count&limit=12&access_token=${accessToken}`
+        );
+        const items: any[] = mediaRes?.data || [];
+        const enriched = await Promise.all(
+          items.map(async (m) => {
+            const ins = await safeAnalyticsCall(
+              `ig.media_insight.${m.id}`,
+              () =>
+                this.fetchIgJson(
+                  `https://${type}/${META_GRAPH_API_VERSION}/${m.id}/insights?metric=views,reach,saved,shares&access_token=${accessToken}`
+                ),
+              null
+            );
+            const map: Record<string, number> = {};
+            for (const row of ins?.data || []) {
+              const v = row?.values?.[0]?.value ?? row?.total_value?.value;
+              if (v !== undefined) map[row.name] = Number(v) || 0;
+            }
+            const likes = Number(m.like_count) || 0;
+            const comments = Number(m.comments_count) || 0;
+            const shares = map.shares;
+            const saves = map.saved;
+            const views = map.views;
+            const reach = map.reach;
+            const denom = reach || views || 0;
+            const interactions =
+              likes + comments + (shares || 0) + (saves || 0);
+            return {
+              id: String(m.id),
+              title: summarizePostTitle(m.caption, m.media_product_type || m.media_type || 'Post'),
+              url: m.permalink,
+              thumbnail: m.thumbnail_url || (m.media_type === 'IMAGE' ? m.media_url : undefined),
+              publishedAt: m.timestamp
+                ? dayjs(m.timestamp).format('YYYY-MM-DD HH:mm')
+                : today,
+              mediaType: m.media_product_type || m.media_type,
+              views,
+              reach,
+              likes,
+              comments,
+              shares,
+              saves,
+              engagementRate:
+                denom > 0
+                  ? Number(((interactions / denom) * 100).toFixed(2))
+                  : undefined,
+            } as AnalyticsPostItem;
+          })
+        );
+        return enriched;
+      },
+      []
+    );
+
+    if (recentPosts.length > 0) {
+      analytics.push({
+        label: 'Recent Posts Performance',
+        percentageChange: 0,
+        category: 'posts',
+        posts: recentPosts,
+        data: [{ total: String(recentPosts.length), date: today }],
+      });
+    }
 
     return analytics;
   }
@@ -1374,64 +1866,146 @@ export class InstagramProvider
     date: number,
     type = 'graph.facebook.com'
   ): Promise<AnalyticsData[]> {
-    const [accessToken, userToken] = token.split('___');
+    const [accessToken] = token.split('___');
     const today = dayjs().format('YYYY-MM-DD');
 
     try {
-      // Fetch media insights from Instagram Graph API
-      const { data } = await (
-        await fetch(
-          `https://${type}/${META_GRAPH_API_VERSION}/${postId}/insights?metric=views,reach,saved,likes,comments,shares&access_token=${accessToken}`
-        )
-      ).json();
+      const [metaInfo, coreData, extraData, reelData] = await Promise.all([
+        safeAnalyticsCall(
+          'ig.post.meta',
+          () =>
+            this.fetchIgJson(
+              `https://${type}/${META_GRAPH_API_VERSION}/${postId}?fields=id,media_type,media_product_type,like_count,comments_count&access_token=${accessToken}`
+            ),
+          null
+        ),
+        safeAnalyticsCall(
+          'ig.post.core',
+          () =>
+            this.fetchIgJson(
+              `https://${type}/${META_GRAPH_API_VERSION}/${postId}/insights?metric=views,reach,saved,likes,comments,shares&access_token=${accessToken}`
+            ),
+          null
+        ),
+        safeAnalyticsCall(
+          'ig.post.extra',
+          () =>
+            this.fetchIgJson(
+              `https://${type}/${META_GRAPH_API_VERSION}/${postId}/insights?metric=total_interactions,follows,profile_visits,profile_activity&access_token=${accessToken}`
+            ),
+          null
+        ),
+        safeAnalyticsCall(
+          'ig.post.reels',
+          () =>
+            this.fetchIgJson(
+              `https://${type}/${META_GRAPH_API_VERSION}/${postId}/insights?metric=ig_reels_avg_watch_time,ig_reels_video_view_total_time&access_token=${accessToken}`
+            ),
+          null
+        ),
+      ]);
 
-      if (!data || data.length === 0) {
-        return [];
+      const metricsMap = new Map<string, number>();
+      for (const batch of [coreData?.data, extraData?.data, reelData?.data]) {
+        for (const metric of batch || []) {
+          const val =
+            metric?.values?.[0]?.value ?? metric?.total_value?.value;
+          if (val !== undefined && typeof val === 'number') {
+            metricsMap.set(metric.name, val);
+          }
+        }
+      }
+
+      if (metricsMap.get('likes') === undefined && metaInfo?.like_count !== undefined) {
+        metricsMap.set('likes', Number(metaInfo.like_count) || 0);
+      }
+      if (metricsMap.get('comments') === undefined && metaInfo?.comments_count !== undefined) {
+        metricsMap.set('comments', Number(metaInfo.comments_count) || 0);
       }
 
       const result: AnalyticsData[] = [];
+      const pushMetric = (
+        key: string,
+        label: string,
+        category: AnalyticsData['category'] = 'engagement',
+        unit: AnalyticsData['unit'] = 'number',
+        transform = (v: number) => v
+      ) => {
+        const raw = metricsMap.get(key);
+        if (raw === undefined) return;
+        const formatted = transform(raw);
+        result.push({
+          label,
+          percentageChange: 0,
+          unit,
+          aggregation: 'latest',
+          category,
+          data: [
+            {
+              total: String(
+                Number.isInteger(formatted)
+                  ? formatted
+                  : Number(formatted.toFixed(2))
+              ),
+              date: today,
+            },
+          ],
+        });
+      };
 
-      for (const metric of data) {
-        const value = metric.values?.[0]?.value;
-        if (value === undefined) continue;
+      pushMetric('views', 'Views', 'overview');
+      pushMetric('reach', 'Reach', 'overview');
+      pushMetric('likes', 'Likes', 'engagement');
+      pushMetric('comments', 'Comments', 'engagement');
+      pushMetric('shares', 'Shares', 'engagement');
+      pushMetric('saved', 'Saves', 'engagement');
+      pushMetric('total_interactions', 'Total Interactions', 'engagement');
+      pushMetric('profile_visits', 'Profile Visits', 'traffic');
+      pushMetric('follows', 'Follows', 'overview');
+      pushMetric(
+        'ig_reels_avg_watch_time',
+        'Average Watch Time',
+        'retention',
+        'seconds',
+        (ms) => ms / 1000
+      );
+      pushMetric(
+        'ig_reels_video_view_total_time',
+        'Total Watch Time',
+        'retention',
+        'minutes',
+        (ms) => ms / 60000
+      );
 
-        let label = '';
-
-        switch (metric.name) {
-          case 'views':
-            label = 'Views';
-            break;
-          case 'reach':
-            label = 'Reach';
-            break;
-          case 'engagement':
-            label = 'Engagement';
-            break;
-          case 'saved':
-            label = 'Saves';
-            break;
-          case 'likes':
-            label = 'Likes';
-            break;
-          case 'comments':
-            label = 'Comments';
-            break;
-          case 'shares':
-            label = 'Shares';
-            break;
-        }
-
-        if (label) {
-          result.push({
-            label,
-            percentageChange: 0,
-            data: [{ total: String(value), date: today }],
-          });
-        }
+      const denom = metricsMap.get('reach') || metricsMap.get('views') || 0;
+      const interactions =
+        metricsMap.get('total_interactions') ??
+        (metricsMap.get('likes') || 0) +
+          (metricsMap.get('comments') || 0) +
+          (metricsMap.get('shares') || 0) +
+          (metricsMap.get('saved') || 0);
+      if (denom > 0 && interactions >= 0) {
+        result.push({
+          label: 'Engagement Rate',
+          percentageChange: 0,
+          average: true,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'engagement',
+          data: [
+            {
+              total: String(Number(((interactions / denom) * 100).toFixed(2))),
+              date: today,
+            },
+          ],
+        });
       }
 
       return result;
     } catch (err) {
+      if (err instanceof RefreshToken || err instanceof Disconnect) {
+        throw err;
+      }
       console.error('Error fetching Instagram post analytics:', err);
       return [];
     }
