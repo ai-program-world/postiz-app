@@ -1422,10 +1422,8 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
               countsRes?.comments?.summary?.total_count !== undefined
                 ? Number(countsRes.comments.summary.total_count) || 0
                 : undefined;
-            const shares =
-              p?.shares?.count !== undefined
-                ? Number(p.shares.count) || 0
-                : undefined;
+            // Graph omits `shares` entirely when a post has no shares
+            const shares = Number(p?.shares?.count) || 0;
             const interactions =
               (likes || 0) + (comments || 0) + (shares || 0) + clicks;
             const engagementBase = reach || views || 0;
@@ -1590,7 +1588,8 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       }
 
       const commentsCount = nodeRes?.comments?.summary?.total_count;
-      const sharesCount = nodeRes?.shares?.count;
+      // Graph omits `shares` entirely when a post has no shares
+      const sharesCount = nodeRes ? Number(nodeRes?.shares?.count) || 0 : undefined;
 
       if (commentsCount !== undefined) {
         result.push({
