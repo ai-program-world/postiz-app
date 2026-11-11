@@ -1367,12 +1367,22 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
         const posts: any[] = feedRes?.data || [];
         return Promise.all(
           posts.map(async (p) => {
-            const [insRes, countsRes] = await Promise.all([
+            // Views/reach are requested on their own so an invalid engagement
+            // metric can't fail the whole call and blank the view counts.
+            const [viewsRes, insRes, countsRes] = await Promise.all([
+              safeAnalyticsCall(
+                `fb.post.views.${p.id}`,
+                () =>
+                  this.fetchFbJson(
+                    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_media_view,post_total_media_view_unique&access_token=${accessToken}`
+                  ),
+                null
+              ),
               safeAnalyticsCall(
                 `fb.post.ins.${p.id}`,
                 () =>
                   this.fetchFbJson(
-                    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_total_media_view_unique,post_clicks,post_reactions_by_type_total&access_token=${accessToken}`
+                    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_clicks,post_reactions_by_type_total&access_token=${accessToken}`
                   ),
                 null
               ),
@@ -1386,15 +1396,23 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
               ),
             ]);
 
+            let views: number | undefined;
             let reach: number | undefined;
             let clicks = 0;
             let likes: number | undefined;
+            for (const m of viewsRes?.data || []) {
+              const v = m?.values?.[0]?.value;
+              if (v === undefined) continue;
+              if (m.name === 'post_media_view') {
+                views = sumValue(v);
+              } else if (m.name === 'post_total_media_view_unique') {
+                reach = sumValue(v);
+              }
+            }
             for (const m of insRes?.data || []) {
               const v = m?.values?.[0]?.value;
               if (v === undefined) continue;
-              if (m.name === 'post_total_media_view_unique') {
-                reach = Number(v) || 0;
-              } else if (m.name === 'post_clicks') {
+              if (m.name === 'post_clicks') {
                 clicks = Number(v) || 0;
               } else if (m.name === 'post_reactions_by_type_total') {
                 likes = sumValue(v);
@@ -1410,6 +1428,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
                 : undefined;
             const interactions =
               (likes || 0) + (comments || 0) + (shares || 0) + clicks;
+            const engagementBase = reach || views || 0;
 
             return {
               id: String(p.id),
@@ -1420,13 +1439,13 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
                 ? dayjs(p.created_time).format('YYYY-MM-DD HH:mm')
                 : today,
               reach,
-              views: reach,
+              views: views ?? reach,
               likes,
               comments,
               shares,
               engagementRate:
-                reach && reach > 0
-                  ? Number(((interactions / reach) * 100).toFixed(2))
+                engagementBase > 0
+                  ? Number(((interactions / engagementBase) * 100).toFixed(2))
                   : undefined,
             } as AnalyticsPostItem;
           })
@@ -1462,9 +1481,24 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     }
 
     try {
-      const [insightsRes, nodeRes] = await Promise.all([
-        this.fetchFbJson(
-          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${postId}/insights?metric=post_total_media_view_unique,post_reactions_by_type_total,post_clicks,post_clicks_by_type&access_token=${accessToken}`
+      // Views/reach and engagement metrics are requested separately so one
+      // invalid metric can't fail the whole call and blank every card.
+      const [viewsRes, insightsRes, nodeRes] = await Promise.all([
+        safeAnalyticsCall(
+          'fb.post.views',
+          () =>
+            this.fetchFbJson(
+              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${postId}/insights?metric=post_media_view,post_total_media_view_unique&access_token=${accessToken}`
+            ),
+          null
+        ),
+        safeAnalyticsCall(
+          'fb.post.insights',
+          () =>
+            this.fetchFbJson(
+              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${postId}/insights?metric=post_reactions_by_type_total,post_clicks,post_clicks_by_type&access_token=${accessToken}`
+            ),
+          null
         ),
         safeAnalyticsCall(
           'fb.post.node',
@@ -1476,9 +1510,10 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
         ),
       ]);
 
-      const data = insightsRes?.data || [];
+      const data = [...(viewsRes?.data || []), ...(insightsRes?.data || [])];
       const result: AnalyticsData[] = [];
       let impressions = 0;
+      let views = 0;
       let reactions = 0;
       let clicks = 0;
 
@@ -1486,10 +1521,20 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
         const value = metric.values?.[0]?.value;
         if (value === undefined) continue;
 
-        if (metric.name === 'post_total_media_view_unique') {
+        if (metric.name === 'post_media_view') {
+          views = Number(value) || 0;
+          result.push({
+            label: 'Views',
+            percentageChange: 0,
+            unit: 'number',
+            aggregation: 'latest',
+            category: 'overview',
+            data: [{ total: String(views), date: today }],
+          });
+        } else if (metric.name === 'post_total_media_view_unique') {
           impressions = Number(value) || 0;
           result.push({
-            label: 'Impressions',
+            label: 'Reach',
             percentageChange: 0,
             unit: 'number',
             aggregation: 'latest',
@@ -1574,7 +1619,8 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
         clicks +
         (Number(commentsCount) || 0) +
         (Number(sharesCount) || 0);
-      if (impressions > 0 && totalEng >= 0) {
+      const engagementBase = impressions || views;
+      if (engagementBase > 0 && totalEng >= 0) {
         result.push({
           label: 'Engagement Rate',
           percentageChange: 0,
@@ -1584,7 +1630,9 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
           category: 'engagement',
           data: [
             {
-              total: String(Number(((totalEng / impressions) * 100).toFixed(2))),
+              total: String(
+                Number(((totalEng / engagementBase) * 100).toFixed(2))
+              ),
               date: today,
             },
           ],
