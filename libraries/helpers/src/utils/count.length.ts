@@ -6,6 +6,21 @@ export const textSlicer = (
   end: number,
   text: string
 ): { start: number; end: number } => {
+  if (integrationType === 'threads') {
+    const chars = [...text];
+    if (chars.length <= end) {
+      return {
+        start: 0,
+        end: text.length,
+      };
+    }
+
+    return {
+      start: 0,
+      end: chars.slice(0, end).join('').length,
+    };
+  }
+
   if (integrationType !== 'x') {
     return {
       start: 0,
