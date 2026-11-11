@@ -88,6 +88,9 @@ export interface AnalyticsPostItem {
   saves?: number;
   engagementRate?: number;
   avgWatchTimeSeconds?: number;
+  // Percent of viewers still watching at 3s / at the end (from retention curve)
+  retention3sRate?: number;
+  completionRate?: number;
 }
 
 export interface AnalyticsData {
@@ -108,6 +111,9 @@ export interface AnalyticsData {
   posts?: AnalyticsPostItem[];
   note?: string;
   updatedAt?: string;
+  // `data` is an ordered curve (e.g. audience retention), not a daily series:
+  // render every point instead of merging into buckets.
+  curve?: boolean;
 }
 
 

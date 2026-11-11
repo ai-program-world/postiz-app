@@ -27,6 +27,8 @@ export interface AnalyticsPostEntry {
   saves?: number;
   engagementRate?: number;
   avgWatchTimeSeconds?: number;
+  retention3sRate?: number;
+  completionRate?: number;
 }
 
 export interface RichAnalyticsItem {
@@ -47,6 +49,7 @@ export interface RichAnalyticsItem {
   posts?: AnalyticsPostEntry[];
   note?: string;
   updatedAt?: string;
+  curve?: boolean;
 }
 
 const METRIC_LABEL_KEYS: Record<string, string> = {
@@ -109,6 +112,8 @@ const METRIC_LABEL_KEYS: Record<string, string> = {
   'Average View Duration': 'metric_avg_view_duration',
   'Average View Percentage': 'metric_avg_view_percentage',
   'Average Watch Time': 'metric_avg_watch_time',
+  'Audience Retention': 'metric_audience_retention',
+  '3s Hold Rate': 'metric_retention_3s_rate',
   'Total Watch Time': 'metric_total_watch_time',
   'Completion Rate': 'metric_completion_rate',
   'Video Duration': 'metric_video_duration',
@@ -308,6 +313,7 @@ export const AnalyticsKpiCard: FC<{
                   data={item.data}
                   color={color}
                   aggregation={effectiveAgg}
+                  maxPoints={item.curve ? item.data.length + 1 : undefined}
                 />
               </div>
             </div>
@@ -459,6 +465,8 @@ type SortKey =
   | 'shares'
   | 'saves'
   | 'engagementRate'
+  | 'retention3sRate'
+  | 'completionRate'
   | 'publishedAt';
 
 export const AnalyticsPostsLeaderboard: FC<{
@@ -476,6 +484,15 @@ export const AnalyticsPostsLeaderboard: FC<{
     () => posts.some((p) => p.avgWatchTimeSeconds !== undefined),
     [posts]
   );
+  const hasRetention = useMemo(
+    () =>
+      posts.some(
+        (p) => p.retention3sRate !== undefined || p.completionRate !== undefined
+      ),
+    [posts]
+  );
+  const fmtPct = (n?: number) =>
+    n === undefined || n === null ? '—' : `${n.toFixed(1)}%`;
 
   const sortedPosts = useMemo(() => {
     const copy = [...posts];
@@ -557,6 +574,16 @@ export const AnalyticsPostsLeaderboard: FC<{
                   {t('metric_avg_watch_time', 'Avg Watch')}
                 </th>
               )}
+              {hasRetention &&
+                renderSortHeader(
+                  'retention3sRate',
+                  t('metric_retention_3s', '3s Hold')
+                )}
+              {hasRetention &&
+                renderSortHeader(
+                  'completionRate',
+                  t('metric_completion_rate', 'Completion Rate')
+                )}
               {renderSortHeader(
                 'engagementRate',
                 t('metric_engagement_rate', 'Eng. Rate')
@@ -639,6 +666,16 @@ export const AnalyticsPostsLeaderboard: FC<{
                     {post.avgWatchTimeSeconds !== undefined
                       ? formatDurationSeconds(post.avgWatchTimeSeconds)
                       : '—'}
+                  </td>
+                )}
+                {hasRetention && (
+                  <td className="px-[12px] py-[10px] text-end tabular-nums">
+                    {fmtPct(post.retention3sRate)}
+                  </td>
+                )}
+                {hasRetention && (
+                  <td className="px-[12px] py-[10px] text-end tabular-nums">
+                    {fmtPct(post.completionRate)}
                   </td>
                 )}
                 <td className="px-[12px] py-[10px] text-end tabular-nums font-medium text-[#32d583]">

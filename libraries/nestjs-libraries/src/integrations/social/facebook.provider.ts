@@ -1373,7 +1373,8 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
             )?.target?.id;
             // Views/reach are requested on their own so an invalid engagement
             // metric can't fail the whole call and blank the view counts.
-            const [viewsRes, insRes, countsRes, watchRes] = await Promise.all([
+            const [viewsRes, insRes, countsRes, watchRes, retention] =
+              await Promise.all([
               safeAnalyticsCall(
                 `fb.post.views.${p.id}`,
                 () =>
@@ -1408,8 +1409,14 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
                     null
                   )
                 : Promise.resolve(null),
+              videoId
+                ? this.fetchVideoRetention(accessToken, videoId)
+                : Promise.resolve(null),
             ]);
             const avgWatchMs = watchRes?.data?.[0]?.values?.[0]?.value;
+            const curve = retention
+              ? this.parseRetentionCurve(retention.value, retention.lengthSec)
+              : null;
 
             let views: number | undefined;
             let reach: number | undefined;
@@ -1464,6 +1471,8 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
                 typeof avgWatchMs === 'number'
                   ? Number((avgWatchMs / 1000).toFixed(1))
                   : undefined,
+              retention3sRate: curve?.retention3sRate,
+              completionRate: curve?.completionRate,
             } as AnalyticsPostItem;
           })
         );
@@ -1667,13 +1676,97 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     }
   }
 
+  /**
+   * Fetches a video's `post_video_retention_graph` together with its length.
+   * Isolated so an unsupported metric never blanks the other video metrics.
+   */
+  private async fetchVideoRetention(
+    accessToken: string,
+    videoId: string
+  ): Promise<{ value: any; lengthSec?: number } | null> {
+    const [graphRes, nodeRes] = await Promise.all([
+      safeAnalyticsCall(
+        `fb.video.retention_graph.${videoId}`,
+        () =>
+          this.fetchFbJson(
+            `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=post_video_retention_graph&access_token=${accessToken}`
+          ),
+        null
+      ),
+      safeAnalyticsCall(
+        `fb.video.length.${videoId}`,
+        () =>
+          this.fetchFbJson(
+            `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}?fields=length&access_token=${accessToken}`
+          ),
+        null
+      ),
+    ]);
+    const value = graphRes?.data?.[0]?.values?.[0]?.value;
+    if (!value || typeof value !== 'object') return null;
+    const lengthSec = Number(nodeRes?.length);
+    return {
+      value,
+      lengthSec: Number.isFinite(lengthSec) && lengthSec > 0 ? lengthSec : undefined,
+    };
+  }
+
+  /**
+   * Turns Meta's retention graph (`{ "0": 1, "1": 0.82, ... }`, evenly spaced
+   * buckets across the video, as a 0-1 share or a 0-100 percent) into percent
+   * points, plus the share still watching at 3 seconds and at the end.
+   */
+  private parseRetentionCurve(value: Record<string, number>, lengthSec?: number) {
+    const entries = Object.entries(value)
+      .map(([k, v]) => ({ idx: Number(k), val: Number(v) }))
+      .filter((e) => Number.isFinite(e.idx) && Number.isFinite(e.val))
+      .sort((a, b) => a.idx - b.idx);
+    if (entries.length < 2) return null;
+
+    const isFraction = entries.every((e) => e.val <= 1.0001);
+    const pct = entries.map((e) => (isFraction ? e.val * 100 : e.val));
+    const lastIdx = entries[entries.length - 1].idx || 1;
+
+    const points = entries.map((e, i) => {
+      const share = e.idx / lastIdx;
+      return {
+        date:
+          lengthSec !== undefined
+            ? `${Number((share * lengthSec).toFixed(1))}s`
+            : `${Math.round(share * 100)}%`,
+        total: String(Number(pct[i].toFixed(1))),
+      };
+    });
+
+    let retention3sRate: number | undefined;
+    if (lengthSec !== undefined) {
+      const target = Math.min(1, 3 / lengthSec) * lastIdx;
+      const after = entries.findIndex((e) => e.idx >= target);
+      if (after <= 0) {
+        retention3sRate = pct[Math.max(after, 0)];
+      } else {
+        const a = entries[after - 1];
+        const b = entries[after];
+        const ratio = (target - a.idx) / (b.idx - a.idx || 1);
+        retention3sRate = pct[after - 1] + (pct[after] - pct[after - 1]) * ratio;
+      }
+      retention3sRate = Number(retention3sRate.toFixed(1));
+    }
+
+    return {
+      points,
+      retention3sRate,
+      completionRate: Number(pct[pct.length - 1].toFixed(1)),
+    };
+  }
+
   private async videoPostAnalytics(
     accessToken: string,
     videoId: string,
     today: string
   ): Promise<AnalyticsData[]> {
     try {
-      const [coreVideoRes, retentionRes] = await Promise.all([
+      const [coreVideoRes, retentionRes, retentionGraph] = await Promise.all([
         fetch(
           `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=total_video_views,total_video_reactions_by_type_total,fb_reels_total_plays,post_video_likes_by_reaction_type,post_video_social_actions&access_token=${accessToken}`
         ).then((r) => r.json()),
@@ -1687,6 +1780,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
           },
           null
         ),
+        this.fetchVideoRetention(accessToken, videoId),
       ]);
 
       const { data, error } = coreVideoRes || {};
@@ -1874,6 +1968,40 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
               date: today,
             },
           ],
+        });
+      }
+
+      const curve = retentionGraph
+        ? this.parseRetentionCurve(retentionGraph.value, retentionGraph.lengthSec)
+        : null;
+      if (curve) {
+        result.push({
+          label: 'Audience Retention',
+          percentageChange: 0,
+          unit: 'percent',
+          // headline = average share watching across the video; the end value is Completion Rate
+          aggregation: 'average',
+          category: 'retention',
+          curve: true,
+          data: curve.points,
+        });
+        if (curve.retention3sRate !== undefined) {
+          result.push({
+            label: '3s Hold Rate',
+            percentageChange: 0,
+            unit: 'percent',
+            aggregation: 'latest',
+            category: 'retention',
+            data: [{ total: String(curve.retention3sRate), date: today }],
+          });
+        }
+        result.push({
+          label: 'Completion Rate',
+          percentageChange: 0,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'retention',
+          data: [{ total: String(curve.completionRate), date: today }],
         });
       }
 
