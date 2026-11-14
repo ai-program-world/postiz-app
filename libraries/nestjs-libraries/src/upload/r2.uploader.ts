@@ -29,6 +29,7 @@ const ALLOWED_EXT_TO_MIME: Record<string, string> = {
   '.tif': 'image/tiff',
   '.tiff': 'image/tiff',
   '.mp4': 'video/mp4',
+  '.mp3': 'audio/mpeg',
 };
 
 // Multipart uploads go through the normalizer, so they may also carry

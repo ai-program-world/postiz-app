@@ -29,6 +29,7 @@ const allowedIntegrations = [
   'pinterest',
   'threads',
   'x',
+  'transistor',
 ];
 export const PlatformAnalytics = () => {
   const fetch = useFetch();
@@ -89,6 +90,7 @@ export const PlatformAnalytics = () => {
         'x',
         'tiktok',
         'tiktok-business',
+        'transistor',
       ].indexOf(currentIntegration.identifier) !== -1
     ) {
       arr.push({
@@ -109,6 +111,7 @@ export const PlatformAnalytics = () => {
         'x',
         'tiktok',
         'tiktok-business',
+        'transistor',
       ].indexOf(currentIntegration.identifier) !== -1
     ) {
       arr.push({
@@ -129,6 +132,7 @@ export const PlatformAnalytics = () => {
         'gmb',
         'tiktok',
         'tiktok-business',
+        'transistor',
       ].indexOf(currentIntegration.identifier) !== -1
     ) {
       arr.push({
