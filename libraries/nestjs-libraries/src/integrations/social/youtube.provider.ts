@@ -984,6 +984,25 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
     return labels[source] || source;
   }
 
+  private formatYoutubeDimension(value: string): string {
+    const labels: Record<string, string> = {
+      SHORTS: 'Shorts',
+      VIDEO_ON_DEMAND: 'Videos',
+      LIVE_STREAM: 'Live',
+      STORY: 'Stories',
+      UNSPECIFIED: 'Unspecified',
+      SUBSCRIBED: 'Subscribed',
+      UNSUBSCRIBED: 'Not Subscribed',
+      MOBILE: 'Mobile',
+      DESKTOP: 'Desktop',
+      TABLET: 'Tablet',
+      TV: 'TV',
+      GAME_CONSOLE: 'Game Console',
+      UNKNOWN_PLATFORM: 'Unknown',
+    };
+    return labels[value] || value;
+  }
+
   private mapYoutubeRows(data: any): Record<string, any>[] {
     const columns: string[] =
       data?.columnHeaders?.map((p: any) => String(p.name || '')) || [];
@@ -1050,6 +1069,28 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         }
       };
 
+      // views split by a single dimension, for breakdown cards
+      const queryViewsBy = async (params: {
+        dimensions: string;
+        sort: string;
+        filters?: string;
+        maxResults?: number;
+      }) => {
+        try {
+          const { data } = await ytAnalyticsClient.reports.query({
+            ids: 'channel==MINE',
+            startDate,
+            endDate,
+            metrics: 'views',
+            ...params,
+          });
+          return this.mapYoutubeRows(data);
+        } catch (err) {
+          this.rethrowYoutubeAuthError(err);
+          throw err;
+        }
+      };
+
       const [
         channelInfo,
         mappedData,
@@ -1058,6 +1099,10 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         countryRows,
         demoRows,
         topVideoRows,
+        contentTypeRows,
+        subscribedStatusRows,
+        deviceRows,
+        searchTermRows,
       ] = await Promise.all([
         safeAnalyticsCall(
           'youtube.channels.list',
@@ -1162,6 +1207,34 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
               throw err;
             }
           },
+          []
+        ),
+        safeAnalyticsCall(
+          'youtube.contentType',
+          () =>
+            queryViewsBy({ dimensions: 'creatorContentType', sort: '-views' }),
+          []
+        ),
+        safeAnalyticsCall(
+          'youtube.subscribedStatus',
+          () =>
+            queryViewsBy({ dimensions: 'subscribedStatus', sort: '-views' }),
+          []
+        ),
+        safeAnalyticsCall(
+          'youtube.deviceType',
+          () => queryViewsBy({ dimensions: 'deviceType', sort: '-views' }),
+          []
+        ),
+        safeAnalyticsCall(
+          'youtube.searchTerms',
+          () =>
+            queryViewsBy({
+              dimensions: 'insightTrafficSourceDetail',
+              filters: 'insightTrafficSourceType==YT_SEARCH',
+              sort: '-views',
+              maxResults: 10,
+            }),
           []
         ),
       ]);
@@ -1392,6 +1465,57 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         }
       }
 
+      const pushViewsBreakdown = (
+        label: string,
+        rows: Record<string, any>[],
+        dimension: string,
+        category: AnalyticsData['category'],
+        limit = 10
+      ) => {
+        const breakdown = buildBreakdown(
+          rows.map((r) => ({
+            label: this.formatYoutubeDimension(String(r[dimension] || '')),
+            value: Number(r.views) || 0,
+          })),
+          limit
+        );
+        if (breakdown.length > 0) {
+          const total = breakdown.reduce((s, b) => s + b.value, 0);
+          acc.push({
+            label,
+            percentageChange: 0,
+            category,
+            breakdown,
+            data: [{ total: String(total), date: endDate }],
+          });
+        }
+      };
+
+      pushViewsBreakdown(
+        'Views by Content Type',
+        contentTypeRows,
+        'creatorContentType',
+        'traffic'
+      );
+      pushViewsBreakdown(
+        'Views by Subscription Status',
+        subscribedStatusRows,
+        'subscribedStatus',
+        'audience'
+      );
+      pushViewsBreakdown(
+        'Views by Device',
+        deviceRows,
+        'deviceType',
+        'audience'
+      );
+      pushViewsBreakdown(
+        'Top Search Terms',
+        searchTermRows,
+        'insightTrafficSourceDetail',
+        'traffic'
+      );
+
       if (topVideoRows.length > 0) {
         const videoIds = topVideoRows
           .map((r) => String(r.video || ''))
@@ -1561,7 +1685,17 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         });
       }
 
-      const [dailyVideoRows, videoTrafficRows] = await Promise.all([
+      // Retention is cumulative over the video's life, so start at publish
+      const publishedDate = video.snippet?.publishedAt
+        ? dayjs(video.snippet.publishedAt).format('YYYY-MM-DD')
+        : startDate;
+
+      const [
+        dailyVideoRows,
+        videoTrafficRows,
+        retentionRows,
+        searchTermRows,
+      ] = await Promise.all([
         safeAnalyticsCall(
           'youtube.postAnalytics.daily',
           async () => {
@@ -1596,6 +1730,49 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
                 metrics: 'views',
                 dimensions: 'insightTrafficSourceType',
                 sort: '-views',
+              });
+              return this.mapYoutubeRows(data);
+            } catch (err) {
+              this.rethrowYoutubeAuthError(err);
+              throw err;
+            }
+          },
+          []
+        ),
+        safeAnalyticsCall(
+          'youtube.postAnalytics.retention',
+          async () => {
+            try {
+              const { data } = await ytAnalyticsClient.reports.query({
+                ids: 'channel==MINE',
+                startDate: publishedDate,
+                endDate: today,
+                filters: `video==${postId}`,
+                metrics: 'audienceWatchRatio',
+                dimensions: 'elapsedVideoTimeRatio',
+                sort: 'elapsedVideoTimeRatio',
+              });
+              return this.mapYoutubeRows(data);
+            } catch (err) {
+              this.rethrowYoutubeAuthError(err);
+              throw err;
+            }
+          },
+          []
+        ),
+        safeAnalyticsCall(
+          'youtube.postAnalytics.searchTerms',
+          async () => {
+            try {
+              const { data } = await ytAnalyticsClient.reports.query({
+                ids: 'channel==MINE',
+                startDate,
+                endDate: today,
+                filters: `video==${postId};insightTrafficSourceType==YT_SEARCH`,
+                metrics: 'views',
+                dimensions: 'insightTrafficSourceDetail',
+                sort: '-views',
+                maxResults: 10,
               });
               return this.mapYoutubeRows(data);
             } catch (err) {
@@ -1706,6 +1883,59 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
             data: [{ total: String(totalTraffic), date: today }],
           });
         }
+      }
+
+      const searchBreakdown = buildBreakdown(
+        searchTermRows.map((r) => ({
+          label: String(r.insightTrafficSourceDetail || ''),
+          value: Number(r.views) || 0,
+        })),
+        10
+      );
+      if (searchBreakdown.length > 0) {
+        const totalSearch = searchBreakdown.reduce((s, b) => s + b.value, 0);
+        result.push({
+          label: 'Top Search Terms',
+          percentageChange: 0,
+          category: 'traffic',
+          breakdown: searchBreakdown,
+          data: [{ total: String(totalSearch), date: today }],
+        });
+      }
+
+      // audienceWatchRatio can go above 1 where viewers rewatch a section
+      const retentionPoints = retentionRows
+        .map((r) => ({
+          ratio: Number(r.elapsedVideoTimeRatio),
+          watch: Number(r.audienceWatchRatio),
+        }))
+        .filter((p) => Number.isFinite(p.ratio) && Number.isFinite(p.watch));
+      const lastRetentionPoint = retentionPoints[retentionPoints.length - 1];
+      if (retentionPoints.length >= 2) {
+        result.push({
+          label: 'Audience Retention',
+          percentageChange: 0,
+          unit: 'percent',
+          aggregation: 'average',
+          category: 'retention',
+          curve: true,
+          data: retentionPoints.map((p) => ({
+            date: `${Math.round(p.ratio * 100)}%`,
+            total: String(Number((p.watch * 100).toFixed(1))),
+          })),
+        });
+      }
+      // sparse curves on low-view videos may stop before the end
+      if (retentionPoints.length >= 2 && lastRetentionPoint.ratio >= 0.99) {
+        const completion = Number((lastRetentionPoint.watch * 100).toFixed(1));
+        result.push({
+          label: 'Completion Rate',
+          percentageChange: 0,
+          unit: 'percent',
+          aggregation: 'latest',
+          category: 'retention',
+          data: [{ total: String(completion), date: today }],
+        });
       }
 
       return result;
