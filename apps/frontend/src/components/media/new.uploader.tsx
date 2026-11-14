@@ -100,6 +100,10 @@ export function useUppyUploader(props: {
           if (type === 'video/*') {
             return ['video/mp4', 'video/mpeg', 'video/quicktime'];
           }
+          // some browsers report mp3 files as audio/mp3
+          if (type === 'audio/mpeg') {
+            return ['audio/mpeg', 'audio/mp3'];
+          }
           // the normalizer turns QuickTime into mp4, nothing else is accepted by the bucket
           if (type === 'video/mp4' && mediaProcessing && !skipMediaRescale) {
             return ['video/mp4', 'video/quicktime'];
@@ -151,9 +155,11 @@ export function useUppyUploader(props: {
           if (fileIDs.includes(file.id)) {
             const isImage = file.type?.startsWith('image/');
             const isVideo = file.type?.startsWith('video/');
+            const isAudio = file.type?.startsWith('audio/');
 
             const maxImageSize = 30 * 1024 * 1024; // 30MB
             const maxVideoSize = 1000 * 1024 * 1024; // 1GB
+            const maxAudioSize = 500 * 1024 * 1024; // 500MB
 
             if (isImage && file.size > maxImageSize) {
               const error = new Error(
@@ -176,6 +182,19 @@ export function useUppyUploader(props: {
               uppy2.info(error.message, 'error', 5000);
               toast.show(
                 `Video file is too large. Maximum size allowed is 1GB.`
+              );
+              uppy2.removeFile(file.id); // Remove file from queue
+              return reject(error);
+            }
+
+            if (isAudio && file.size > maxAudioSize) {
+              const error = new Error(
+                `Audio file "${file.name}" is too large. Maximum size allowed is 500MB.`
+              );
+              uppy2.log(error.message, 'error');
+              uppy2.info(error.message, 'error', 5000);
+              toast.show(
+                `Audio file is too large. Maximum size allowed is 500MB.`
               );
               uppy2.removeFile(file.id); // Remove file from queue
               return reject(error);
