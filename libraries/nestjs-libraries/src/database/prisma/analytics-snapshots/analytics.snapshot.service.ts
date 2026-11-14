@@ -5,6 +5,7 @@ import utc from 'dayjs/plugin/utc';
 import { AnalyticsSnapshotRepository } from '@gitroom/nestjs-libraries/database/prisma/analytics-snapshots/analytics.snapshot.repository';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
+import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 import {
   AnalyticsData,
   AnalyticsPostItem,
@@ -18,6 +19,11 @@ import {
 dayjs.extend(utc);
 
 export type AnalyticsSyncKind = 'snapshot' | 'story';
+
+// Stories cost API calls every hour, so they are only stored for
+// organizations that opened analytics in the last 30 days
+const VIEWED_TTL = 30 * 24 * 3600;
+const viewedKey = (orgId: string) => `analytics:viewed:${orgId}`;
 
 @Injectable()
 export class AnalyticsSnapshotService {
@@ -47,6 +53,18 @@ export class AnalyticsSnapshotService {
     const missingOn =
       kind === 'snapshot' ? dayjs.utc().startOf('day').toDate() : undefined;
 
+    const viewed = new Map<string, boolean>();
+    const isViewed = async (orgId: string) => {
+      if (!viewed.has(orgId)) {
+        try {
+          viewed.set(orgId, !!(await ioRedis.get(viewedKey(orgId))));
+        } catch (err) {
+          viewed.set(orgId, false);
+        }
+      }
+      return viewed.get(orgId)!;
+    };
+
     let cursor: string | undefined;
     let synced = 0;
     while (true) {
@@ -59,15 +77,21 @@ export class AnalyticsSnapshotService {
       if (!page.length) {
         break;
       }
-      for (let i = 0; i < page.length; i += 10) {
+      cursor = page[page.length - 1].id;
+      const targets: typeof page = [];
+      for (const p of page) {
+        if (kind !== 'story' || (await isViewed(p.organizationId))) {
+          targets.push(p);
+        }
+      }
+      for (let i = 0; i < targets.length; i += 10) {
         const results = await Promise.all(
-          page
+          targets
             .slice(i, i + 10)
             .map((p) => this.syncIntegration(p.organizationId, p.id, kind))
         );
         synced += results.filter(Boolean).length;
       }
-      cursor = page[page.length - 1].id;
     }
     return synced;
   }
@@ -148,6 +172,12 @@ export class AnalyticsSnapshotService {
     date: string,
     skipCache = false
   ): Promise<AnalyticsData[]> {
+    try {
+      await ioRedis.set(viewedKey(org.id), '1', 'EX', VIEWED_TTL);
+    } catch (err) {
+      /** only affects which organizations get story sync **/
+    }
+
     const analytics = await this._integrationService.checkAnalytics(
       org,
       integration,

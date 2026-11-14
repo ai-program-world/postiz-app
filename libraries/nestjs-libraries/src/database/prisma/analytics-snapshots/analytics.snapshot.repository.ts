@@ -28,6 +28,9 @@ export class AnalyticsSnapshotRepository {
         disabled: false,
         inBetweenSteps: false,
         refreshNeeded: false,
+        // id > cursor instead of a Prisma cursor: synced channels drop out of
+        // the missingOn filter while the walk is still running
+        ...(cursor ? { id: { gt: cursor } } : {}),
         ...(missingOn
           ? { analyticsSnapshots: { none: { date: missingOn } } }
           : {}),
@@ -38,7 +41,6 @@ export class AnalyticsSnapshotRepository {
       },
       orderBy: { id: 'asc' },
       take,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
   }
 
