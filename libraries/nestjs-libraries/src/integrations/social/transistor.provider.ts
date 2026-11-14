@@ -199,10 +199,13 @@ export class TransistorProvider
     ];
   }
 
+  // Only a draft with the same title and description counts, so an unrelated
+  // draft of the user is never overwritten; a failed lookup creates a new one
   private async findDraft(
     accessToken: string,
     show: string,
-    title: string
+    title: string,
+    description: string
   ): Promise<string | undefined> {
     const params = new URLSearchParams({
       show_id: show,
@@ -210,17 +213,25 @@ export class TransistorProvider
       query: title,
       'pagination[per]': '50',
     });
-    const { data } = await (
-      await this.fetch(`${TRANSISTOR_API}/episodes?${params}`, {
-        headers: {
-          'x-api-key': accessToken,
-          Accept: 'application/json',
-        },
-      })
-    ).json();
+    try {
+      const { data } = await (
+        await this.fetch(`${TRANSISTOR_API}/episodes?${params}`, {
+          headers: {
+            'x-api-key': accessToken,
+            Accept: 'application/json',
+          },
+        })
+      ).json();
 
-    const draft = (data || []).find((p: any) => p?.attributes?.title === title);
-    return draft ? String(draft.id) : undefined;
+      const draft = (data || []).find(
+        (p: any) =>
+          p?.attributes?.title === title &&
+          p?.attributes?.description === description
+      );
+      return draft ? String(draft.id) : undefined;
+    } catch (err) {
+      return undefined;
+    }
   }
 
   async post(
@@ -248,7 +259,8 @@ export class TransistorProvider
     const draftId = await this.findDraft(
       accessToken,
       settings.show,
-      settings.title
+      settings.title,
+      message
     );
 
     const { data: episode } = await (
