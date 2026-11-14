@@ -1004,6 +1004,9 @@
   "metric_clicks_by_type": "Clicks by Type",
   "metric_traffic_sources": "Traffic Sources",
   "metric_recent_posts_performance": "Recent Posts Performance",
+  "metric_stories_performance": "Stories Performance",
+  "metric_story_navigation": "Story Navigation",
+  "metric_follower_history": "Follower History",
   "metric_top_videos_performance": "Top Videos Performance",
   "bd_follower": "Followers",
   "bd_non_follower": "Non-followers",
@@ -1049,5 +1052,10 @@
   "bd_tablet": "Tablet",
   "bd_tv": "TV",
   "bd_game_console": "Game Console",
-  "bd_unknown_platform": "Unknown"
+  "bd_unknown_platform": "Unknown",
+  "bd_tap_forward": "Tap Forward",
+  "bd_tap_back": "Tap Back",
+  "bd_tap_exit": "Exit",
+  "bd_swipe_forward": "Swipe to Next Account",
+  "bd_automatic_forward": "Auto Forward"
 }

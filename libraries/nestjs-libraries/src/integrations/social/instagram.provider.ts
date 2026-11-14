@@ -1,11 +1,13 @@
 import {
   AnalyticsData,
   AnalyticsPostItem,
+  AnalyticsSnapshotData,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
   PostResponse,
   SocialProvider,
+  StoryInsightData,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id';
 import { timer } from '@gitroom/helpers/utils/timer';
@@ -2125,5 +2127,108 @@ export class InstagramProvider
       console.error('Error fetching Instagram post analytics:', err);
       return [];
     }
+  }
+
+  async analyticsSnapshot(
+    id: string,
+    token: string,
+    type = 'graph.facebook.com'
+  ): Promise<AnalyticsSnapshotData | undefined> {
+    const [accessToken] = token.split('___');
+    const profile = await this.fetchIgJson(
+      `https://${type}/${META_GRAPH_API_VERSION}/${id}?fields=followers_count&access_token=${accessToken}`
+    );
+
+    const demographics: Record<string, Record<string, number>> = {};
+    for (const breakdown of ['country', 'city', 'age', 'gender']) {
+      const res = await safeAnalyticsCall(
+        `ig.snapshot.${breakdown}`,
+        () =>
+          this.fetchIgJson(
+            `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=follower_demographics&period=lifetime&metric_type=total_value&breakdown=${breakdown}&access_token=${accessToken}`
+          ),
+        null
+      );
+      const map: Record<string, number> = {};
+      for (const row of res?.data?.[0]?.total_value?.breakdowns?.[0]
+        ?.results || []) {
+        const dim = (row.dimension_values || []).join(' ');
+        if (dim) {
+          map[dim] = (map[dim] || 0) + (Number(row.value) || 0);
+        }
+      }
+      if (Object.keys(map).length > 0) {
+        demographics[breakdown] = map;
+      }
+    }
+
+    return {
+      followers:
+        profile?.followers_count !== undefined
+          ? Number(profile.followers_count) || 0
+          : undefined,
+      demographics:
+        Object.keys(demographics).length > 0 ? demographics : undefined,
+    };
+  }
+
+  async storyInsights(
+    id: string,
+    token: string,
+    type = 'graph.facebook.com'
+  ): Promise<StoryInsightData[]> {
+    const [accessToken] = token.split('___');
+    const stories = await this.fetchIgJson(
+      `https://${type}/${META_GRAPH_API_VERSION}/${id}/stories?fields=id,media_type,permalink,thumbnail_url,media_url,timestamp&access_token=${accessToken}`
+    );
+
+    const result: StoryInsightData[] = [];
+    for (const story of stories?.data || []) {
+      // navigation only accepts its own breakdown, so it gets its own call
+      const [core, navigation] = await Promise.all([
+        safeAnalyticsCall(
+          'ig.story.core',
+          () =>
+            this.fetchIgJson(
+              `https://${type}/${META_GRAPH_API_VERSION}/${story.id}/insights?metric=reach,views,replies,shares,total_interactions,follows,profile_visits&access_token=${accessToken}`
+            ),
+          null
+        ),
+        safeAnalyticsCall(
+          'ig.story.navigation',
+          () =>
+            this.fetchIgJson(
+              `https://${type}/${META_GRAPH_API_VERSION}/${story.id}/insights?metric=navigation&breakdown=story_navigation_action_type&access_token=${accessToken}`
+            ),
+          null
+        ),
+      ]);
+
+      const metrics: Record<string, number> = {};
+      for (const metric of core?.data || []) {
+        const val = metric?.values?.[0]?.value ?? metric?.total_value?.value;
+        if (typeof val === 'number') {
+          metrics[metric.name] = val;
+        }
+      }
+      for (const row of navigation?.data?.[0]?.total_value?.breakdowns?.[0]
+        ?.results || []) {
+        const action = String(row.dimension_values?.[0] || '').toLowerCase();
+        if (action) {
+          metrics[`navigation_${action}`] = Number(row.value) || 0;
+        }
+      }
+
+      result.push({
+        id: String(story.id),
+        permalink: story.permalink,
+        thumbnail: story.thumbnail_url || story.media_url,
+        mediaType: story.media_type,
+        publishedAt: story.timestamp,
+        metrics,
+      });
+    }
+
+    return result;
   }
 }

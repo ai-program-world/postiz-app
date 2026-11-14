@@ -2,15 +2,15 @@ import { Controller, Get, Param, Query } from '@nestjs/common';
 import { Organization } from '@prisma/client';
 import { GetOrgFromRequest } from '@gitroom/nestjs-libraries/user/org.from.request';
 import { ApiTags } from '@nestjs/swagger';
-import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
+import { AnalyticsSnapshotService } from '@gitroom/nestjs-libraries/database/prisma/analytics-snapshots/analytics.snapshot.service';
 
 @ApiTags('Analytics')
 @Controller('/analytics')
 export class AnalyticsController {
   constructor(
-    private _integrationService: IntegrationService,
-    private _postsService: PostsService
+    private _postsService: PostsService,
+    private _analyticsSnapshotService: AnalyticsSnapshotService
   ) {}
 
   @Get('/:integration')
@@ -21,11 +21,11 @@ export class AnalyticsController {
     @Query('refresh') refresh?: string
   ) {
     const skipCache = refresh === 'true' || refresh === '1';
-    return this._integrationService.checkAnalytics(
+    // Stored history is app-only for now, the public API keeps checkAnalytics
+    return this._analyticsSnapshotService.checkAnalyticsWithHistory(
       org,
       integration,
       date,
-      false,
       skipCache
     );
   }

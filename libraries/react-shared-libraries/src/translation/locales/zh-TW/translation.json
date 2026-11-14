@@ -1004,6 +1004,9 @@
   "metric_clicks_by_type": "各類點擊分佈",
   "metric_traffic_sources": "流量來源分佈",
   "metric_recent_posts_performance": "近期貼文成效排行",
+  "metric_stories_performance": "限時動態成效",
+  "metric_story_navigation": "限時動態瀏覽動作",
+  "metric_follower_history": "追蹤者歷史",
   "metric_top_videos_performance": "熱門影片成效排行",
   "bd_follower": "追蹤者",
   "bd_non_follower": "非追蹤者",
@@ -1049,5 +1052,10 @@
   "bd_tablet": "平板",
   "bd_tv": "電視",
   "bd_game_console": "遊戲主機",
-  "bd_unknown_platform": "未知"
+  "bd_unknown_platform": "未知",
+  "bd_tap_forward": "點擊前進",
+  "bd_tap_back": "點擊返回",
+  "bd_tap_exit": "離開",
+  "bd_swipe_forward": "滑到下一個帳號",
+  "bd_automatic_forward": "自動前進"
 }
