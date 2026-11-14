@@ -18,6 +18,7 @@ import { HashnodeSettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/provid
 import { WordpressDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/wordpress.dto';
 import { ListmonkDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/listmonk.dto';
 import { TransistorDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/transistor.dto';
+import { PodbeanDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/podbean.dto';
 import { GmbSettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/gmb.settings.dto';
 import { FarcasterDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/farcaster.dto';
 import { FacebookDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/facebook.dto';
@@ -51,6 +52,7 @@ export type AllProvidersSettings =
   | ProviderExtension<'wordpress', WordpressDto>
   | ProviderExtension<'listmonk', ListmonkDto>
   | ProviderExtension<'transistor', TransistorDto>
+  | ProviderExtension<'podbean', PodbeanDto>
   | ProviderExtension<'gmb', GmbSettingsDto>
   | ProviderExtension<'facebook', FacebookDto>
   | ProviderExtension<'wrapcast', FarcasterDto>
@@ -92,6 +94,7 @@ export const allProviders = (setEmpty?: any) => {
     { value: HashnodeSettingsDto, name: 'hashnode' },
     { value: ListmonkDto, name: 'listmonk' },
     { value: TransistorDto, name: 'transistor' },
+    { value: PodbeanDto, name: 'podbean' },
     { value: GmbSettingsDto, name: 'gmb' },
     { value: FarcasterDto, name: 'wrapcast' },
     { value: FacebookDto, name: 'facebook' },

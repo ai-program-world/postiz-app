@@ -30,6 +30,7 @@ const allowedIntegrations = [
   'threads',
   'x',
   'transistor',
+  'podbean',
 ];
 export const PlatformAnalytics = () => {
   const fetch = useFetch();
@@ -91,6 +92,7 @@ export const PlatformAnalytics = () => {
         'tiktok',
         'tiktok-business',
         'transistor',
+        'podbean',
       ].indexOf(currentIntegration.identifier) !== -1
     ) {
       arr.push({
@@ -112,6 +114,7 @@ export const PlatformAnalytics = () => {
         'tiktok',
         'tiktok-business',
         'transistor',
+        'podbean',
       ].indexOf(currentIntegration.identifier) !== -1
     ) {
       arr.push({
@@ -133,6 +136,7 @@ export const PlatformAnalytics = () => {
         'tiktok',
         'tiktok-business',
         'transistor',
+        'podbean',
       ].indexOf(currentIntegration.identifier) !== -1
     ) {
       arr.push({

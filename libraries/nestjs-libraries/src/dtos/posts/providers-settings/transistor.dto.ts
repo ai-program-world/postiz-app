@@ -3,27 +3,13 @@ import {
   IsIn,
   IsOptional,
   IsString,
-  Matches,
   MaxLength,
   MinLength,
-  Validate,
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { JSONSchema } from 'class-validator-jsonschema';
-import { ValidUrlPath } from '@gitroom/helpers/utils/valid.url.path';
-
-export class TransistorAudioDto {
-  @IsString()
-  @IsDefined()
-  id: string;
-
-  @IsString()
-  @IsDefined()
-  @Validate(ValidUrlPath)
-  @Matches(/\.mp3(\?.*)?$/i, { message: 'Audio must be an .mp3 file' })
-  path: string;
-}
+import { AudioMediaDto } from '@gitroom/nestjs-libraries/dtos/media/audio.media.dto';
 
 export class TransistorDto {
   @IsString()
@@ -50,10 +36,10 @@ export class TransistorDto {
 
   @IsDefined()
   @ValidateNested()
-  @Type(() => TransistorAudioDto)
+  @Type(() => AudioMediaDto)
   @JSONSchema({
     description:
       'The episode audio, an .mp3 from the media library (upload it with uploadFromUrlTool first)',
   })
-  audio: TransistorAudioDto;
+  audio: AudioMediaDto;
 }

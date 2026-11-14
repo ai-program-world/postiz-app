@@ -11,6 +11,7 @@ import dayjs from 'dayjs';
 import { TransistorDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/transistor.dto';
 import { Tool } from '@gitroom/nestjs-libraries/integrations/tool.decorator';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
+import { computeSeriesTrend } from '@gitroom/nestjs-libraries/integrations/social/analytics.helper';
 
 const TRANSISTOR_API = 'https://api.transistor.fm/v1';
 
@@ -156,15 +157,17 @@ export class TransistorProvider
       }
     }
 
+    const data = Object.keys(totals)
+      .sort()
+      .map((day) => ({ date: day, total: String(totals[day]) }));
+
     return [
       {
         label: 'Downloads',
-        percentageChange: 0,
+        percentageChange: computeSeriesTrend(data),
         aggregation: 'sum',
         category: 'overview',
-        data: Object.keys(totals)
-          .sort()
-          .map((day) => ({ date: day, total: String(totals[day]) })),
+        data,
       },
     ];
   }
@@ -181,15 +184,17 @@ export class TransistorProvider
       date
     );
 
+    const data = downloads.map((item) => ({
+      date: item.date,
+      total: String(item.total),
+    }));
+
     return [
       {
         label: 'Downloads',
-        percentageChange: 0,
+        percentageChange: computeSeriesTrend(data),
         aggregation: 'sum',
-        data: downloads.map((item) => ({
-          date: item.date,
-          total: String(item.total),
-        })),
+        data,
       },
     ];
   }
