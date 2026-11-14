@@ -82,7 +82,7 @@ export class PodbeanProvider extends SocialAbstract implements SocialProvider {
   }
 
   async refreshToken(refreshToken: string): Promise<AuthTokenDetails> {
-    const { access_token, expires_in } = await (
+    const { access_token, refresh_token, expires_in } = await (
       await this.fetch(`${PODBEAN_API}/oauth/token`, {
         method: 'POST',
         headers: {
@@ -100,8 +100,8 @@ export class PodbeanProvider extends SocialAbstract implements SocialProvider {
     return {
       ...(await this.podcast(access_token)),
       accessToken: access_token,
-      // Podbean keeps the same refresh token, it only sends a new access token
-      refreshToken,
+      // keep the current refresh token when Podbean does not rotate it
+      refreshToken: refresh_token || refreshToken,
       expiresIn: expires_in,
     };
   }
@@ -142,7 +142,10 @@ export class PodbeanProvider extends SocialAbstract implements SocialProvider {
       })
     ).json();
 
-    this.checkScopes(this.scopes, scope || '');
+    // the scope field is not always part of the token answer, only check it when it is
+    if (scope) {
+      this.checkScopes(this.scopes, scope);
+    }
 
     return {
       ...(await this.podcast(access_token)),

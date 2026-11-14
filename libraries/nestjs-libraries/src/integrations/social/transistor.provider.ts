@@ -199,6 +199,30 @@ export class TransistorProvider
     ];
   }
 
+  private async findDraft(
+    accessToken: string,
+    show: string,
+    title: string
+  ): Promise<string | undefined> {
+    const params = new URLSearchParams({
+      show_id: show,
+      status: 'draft',
+      query: title,
+      'pagination[per]': '50',
+    });
+    const { data } = await (
+      await this.fetch(`${TRANSISTOR_API}/episodes?${params}`, {
+        headers: {
+          'x-api-key': accessToken,
+          Accept: 'application/json',
+        },
+      })
+    ).json();
+
+    const draft = (data || []).find((p: any) => p?.attributes?.title === title);
+    return draft ? String(draft.id) : undefined;
+  }
+
   async post(
     id: string,
     accessToken: string,
@@ -211,25 +235,39 @@ export class TransistorProvider
         : ``
     }${settings.audio.path}`;
 
+    const fields = {
+      title: settings.title,
+      description: message,
+      audio_url: audioUrl,
+      ...(settings.summary ? { summary: settings.summary } : {}),
+      ...(settings.episodeType ? { type: settings.episodeType } : {}),
+    };
+
+    // Creating and publishing are two calls, so a retry after a failed publish
+    // finds the draft it already created and updates it instead of adding another
+    const draftId = await this.findDraft(
+      accessToken,
+      settings.show,
+      settings.title
+    );
+
     const { data: episode } = await (
-      await this.fetch(`${TRANSISTOR_API}/episodes`, {
-        method: 'POST',
-        headers: {
-          'x-api-key': accessToken,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
-          episode: {
-            show_id: settings.show,
-            title: settings.title,
-            description: message,
-            audio_url: audioUrl,
-            ...(settings.summary ? { summary: settings.summary } : {}),
-            ...(settings.episodeType ? { type: settings.episodeType } : {}),
+      await this.fetch(
+        draftId
+          ? `${TRANSISTOR_API}/episodes/${draftId}`
+          : `${TRANSISTOR_API}/episodes`,
+        {
+          method: draftId ? 'PATCH' : 'POST',
+          headers: {
+            'x-api-key': accessToken,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
           },
-        }),
-      })
+          body: JSON.stringify({
+            episode: draftId ? fields : { show_id: settings.show, ...fields },
+          }),
+        }
+      )
     ).json();
 
     const { data: published } = await (
