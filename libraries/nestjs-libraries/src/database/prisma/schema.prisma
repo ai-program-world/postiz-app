@@ -45,6 +45,8 @@ model Organization {
   webhooks            Webhooks[]
   oauthApp            OAuthApp[]
   oauthAuthorizations OAuthAuthorization[]
+  analyticsSnapshots  AnalyticsSnapshot[]
+  storyInsights       StoryInsight[]
 
   @@index([apiKey])
   @@index([streakSince])
@@ -398,6 +400,8 @@ model Integration {
   orderItems            OrderItems[]
   plugs                 Plugs[]
   posts                 Post[]
+  analyticsSnapshots    AnalyticsSnapshot[]
+  storyInsights         StoryInsight[]
 
   @@unique([organizationId, internalId])
   @@index([rootInternalId])
@@ -1844,4 +1848,43 @@ model Announcement {
   description String
   color       AnnouncementColor @default(INFO)
   createdAt   DateTime          @default(now())
+}
+
+// One row per channel per day, filled by analyticsSnapshotWorkflow, so
+// follower history outlives the window the platform APIs return
+model AnalyticsSnapshot {
+  id             String       @id @default(uuid())
+  organizationId String
+  integrationId  String
+  date           DateTime     @db.Date
+  followers      Int?
+  demographics   Json?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  integration    Integration  @relation(fields: [integrationId], references: [id])
+
+  @@unique([integrationId, date])
+  @@index([organizationId])
+}
+
+// Latest insights of a story, kept after the platform drops it (24h)
+model StoryInsight {
+  id             String       @id @default(uuid())
+  organizationId String
+  integrationId  String
+  internalId     String
+  permalink      String?
+  thumbnail      String?
+  mediaType      String?
+  publishedAt    DateTime
+  metrics        Json
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  integration    Integration  @relation(fields: [integrationId], references: [id])
+
+  @@unique([integrationId, internalId])
+  @@index([organizationId])
+  @@index([integrationId, publishedAt])
 }

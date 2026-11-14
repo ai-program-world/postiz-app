@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   AnalyticsPostItem,
+  AnalyticsSnapshotData,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -1618,6 +1619,18 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     }
 
     return result;
+  }
+
+  async analyticsSnapshot(
+    id: string,
+    accessToken: string
+  ): Promise<AnalyticsSnapshotData | undefined> {
+    const page = await this.fetchFbJson(
+      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}?fields=followers_count&access_token=${accessToken}`
+    );
+    return page?.followers_count !== undefined
+      ? { followers: Number(page.followers_count) || 0 }
+      : undefined;
   }
 
   async postAnalytics(

@@ -53,6 +53,8 @@ import { ErrorsRepository } from '@gitroom/nestjs-libraries/database/prisma/erro
 import { ErrorsService } from '@gitroom/nestjs-libraries/database/prisma/errors/errors.service';
 import { AdminStatsRepository } from '@gitroom/nestjs-libraries/database/prisma/admin-stats/admin-stats.repository';
 import { AdminStatsService } from '@gitroom/nestjs-libraries/database/prisma/admin-stats/admin-stats.service';
+import { AnalyticsSnapshotRepository } from '@gitroom/nestjs-libraries/database/prisma/analytics-snapshots/analytics.snapshot.repository';
+import { AnalyticsSnapshotService } from '@gitroom/nestjs-libraries/database/prisma/analytics-snapshots/analytics.snapshot.service';
 
 @Global()
 @Module({
@@ -115,6 +117,8 @@ import { AdminStatsService } from '@gitroom/nestjs-libraries/database/prisma/adm
     ErrorsService,
     AdminStatsRepository,
     AdminStatsService,
+    AnalyticsSnapshotRepository,
+    AnalyticsSnapshotService,
   ],
   get exports() {
     return this.providers;

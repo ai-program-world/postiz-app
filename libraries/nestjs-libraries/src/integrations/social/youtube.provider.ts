@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   AnalyticsPostItem,
+  AnalyticsSnapshotData,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -1593,6 +1594,27 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       this.rethrowYoutubeAuthError(err);
       console.error('Error fetching YouTube analytics:', err?.message || err);
       return [];
+    }
+  }
+
+  async analyticsSnapshot(
+    id: string,
+    accessToken: string
+  ): Promise<AnalyticsSnapshotData | undefined> {
+    const { client, youtube } = clientAndYoutube();
+    client.setCredentials({ access_token: accessToken });
+    try {
+      const res = await youtube(client).channels.list({
+        part: ['statistics'],
+        mine: true,
+      });
+      const count = res.data.items?.[0]?.statistics?.subscriberCount;
+      return count !== undefined && count !== null
+        ? { followers: Number(count) || 0 }
+        : undefined;
+    } catch (err) {
+      this.rethrowYoutubeAuthError(err);
+      throw err;
     }
   }
 

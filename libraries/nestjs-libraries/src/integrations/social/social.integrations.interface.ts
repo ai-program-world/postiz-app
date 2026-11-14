@@ -34,6 +34,13 @@ export interface IAuthenticator {
     postId: string,
     fromDate: number,
   ): Promise<AnalyticsData[]>;
+  // Point-in-time numbers stored once a day by analyticsSnapshotWorkflow
+  analyticsSnapshot?(
+    id: string,
+    accessToken: string
+  ): Promise<AnalyticsSnapshotData | undefined>;
+  // Live stories with their insights, stored hourly before they expire
+  storyInsights?(id: string, accessToken: string): Promise<StoryInsightData[]>;
   resolveReleaseId?(
     accessToken: string,
     releaseId: string,
@@ -116,6 +123,21 @@ export interface AnalyticsData {
   curve?: boolean;
 }
 
+
+export interface AnalyticsSnapshotData {
+  followers?: number;
+  // e.g. { country: { TW: 120 }, age: { '25-34': 40 } }
+  demographics?: Record<string, Record<string, number>>;
+}
+
+export interface StoryInsightData {
+  id: string;
+  permalink?: string;
+  thumbnail?: string;
+  mediaType?: string;
+  publishedAt: string;
+  metrics: Record<string, number>;
+}
 
 export type GenerateAuthUrlResponse = {
   url: string;
