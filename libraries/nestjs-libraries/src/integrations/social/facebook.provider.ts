@@ -1309,6 +1309,133 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       });
     }
 
+    // 3b. Follower total, follower location and Page video metrics (each in
+    // its own call: one invalid metric in a list fails the whole request)
+    const fetchDailySeries = async (metric: string) => {
+      const raw: Array<{ date: string; total: number }> = [];
+      for (const w of windows) {
+        const res = await this.fetchFbJson(
+          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/insights?metric=${metric}&period=day&since=${w.since}&until=${w.until}&access_token=${accessToken}`
+        );
+        for (const v of res?.data?.[0]?.values || []) {
+          raw.push({
+            date: dayjs(v.end_time).format('YYYY-MM-DD'),
+            total: sumValue(v.value),
+          });
+        }
+      }
+      return mergeDailyPoints(raw);
+    };
+
+    // Location metrics are a running total per day and lag 1-2 days: keep
+    // the most recent non-empty object
+    const fetchLatestBreakdown = async (metric: string) => {
+      const since = dayjs().subtract(7, 'day').startOf('day').unix();
+      const until = dayjs().endOf('day').unix();
+      const res = await this.fetchFbJson(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/insights?metric=${metric}&period=day&since=${since}&until=${until}&access_token=${accessToken}`
+      );
+      const values: any[] = res?.data?.[0]?.values || [];
+      const latest = [...values]
+        .reverse()
+        .find(
+          (v) =>
+            v?.value &&
+            typeof v.value === 'object' &&
+            Object.keys(v.value).length > 0
+        );
+      return (latest?.value as Record<string, number>) || {};
+    };
+
+    const [
+      followsPts,
+      videoViewsPts,
+      videoViewTimePts,
+      followsCountry,
+      followsCity,
+    ] = await Promise.all([
+      safeAnalyticsCall(
+        'fb.page_follows',
+        () => fetchDailySeries('page_follows'),
+        []
+      ),
+      safeAnalyticsCall(
+        'fb.page_video_views',
+        () => fetchDailySeries('page_video_views'),
+        []
+      ),
+      safeAnalyticsCall(
+        'fb.page_video_view_time',
+        () => fetchDailySeries('page_video_view_time'),
+        []
+      ),
+      safeAnalyticsCall(
+        'fb.page_follows_country',
+        () => fetchLatestBreakdown('page_follows_country'),
+        {} as Record<string, number>
+      ),
+      safeAnalyticsCall(
+        'fb.page_follows_city',
+        () => fetchLatestBreakdown('page_follows_city'),
+        {} as Record<string, number>
+      ),
+    ]);
+
+    if (followsPts.length > 0) {
+      result.push({
+        label: 'Followers Over Time',
+        percentageChange: computeSeriesTrend(followsPts, 'latest'),
+        aggregation: 'latest',
+        unit: 'number',
+        category: 'audience',
+        data: followsPts,
+      });
+    }
+
+    if (videoViewsPts.length > 0) {
+      result.push({
+        label: 'Video Views',
+        percentageChange: computeSeriesTrend(videoViewsPts, 'sum'),
+        aggregation: 'sum',
+        unit: 'number',
+        category: 'retention',
+        data: videoViewsPts,
+      });
+    }
+
+    if (videoViewTimePts.length > 0) {
+      // page_video_view_time is reported in milliseconds
+      const minutesPts = videoViewTimePts.map((p) => ({
+        date: p.date,
+        total: String(Number(((Number(p.total) || 0) / 60000).toFixed(2))),
+      }));
+      result.push({
+        label: 'Total Watch Time',
+        percentageChange: computeSeriesTrend(minutesPts, 'sum'),
+        aggregation: 'sum',
+        unit: 'minutes',
+        category: 'retention',
+        data: minutesPts,
+      });
+    }
+
+    for (const [label, map] of [
+      ['Followers by Country', followsCountry],
+      ['Followers by City', followsCity],
+    ] as const) {
+      const bd = buildBreakdown(map, 10);
+      if (bd.length > 0) {
+        const sum = bd.reduce((a, b) => a + b.value, 0);
+        result.push({
+          label,
+          percentageChange: 0,
+          category: 'audience',
+          breakdown: bd,
+          data: [{ total: String(sum), date: today }],
+        });
+      }
+    }
+
     // Derived Engagement Rate
     const impSum =
       coreSums.page_total_media_view_unique || coreSums.page_media_view || 0;
