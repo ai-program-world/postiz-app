@@ -944,6 +944,14 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         // and URL (a token problem is left to the refresh + retry path, the
         // thumbnail call is idempotent)
         if (err instanceof BadBody && pendingData.postDbId) {
+          // a rejected thumbnail ends the post here, still file the video
+          if (pendingData.playlistId) {
+            await this.addToPlaylist(
+              accessToken,
+              videoId,
+              pendingData.playlistId
+            );
+          }
           throw new PublishedWithError(
             this.identifier,
             pendingData.postDbId,
@@ -956,8 +964,9 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       }
     }
 
-    // last step on purpose: nothing after it can throw, so a retry of this
-    // activity never adds the same video to the playlist twice
+    // last step on purpose: nothing after it throws, so an error retry of this
+    // activity does not add the video twice (only an activity timeout right
+    // after the insert could)
     if (pendingData.playlistId) {
       await this.addToPlaylist(accessToken, videoId, pendingData.playlistId);
     }

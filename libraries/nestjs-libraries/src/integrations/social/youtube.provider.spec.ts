@@ -30,6 +30,10 @@ jest.mock('@gitroom/nestjs-libraries/temporal/temporal.heartbeat', () => ({
 import { YoutubeProvider } from './youtube.provider';
 import { YoutubeSettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/youtube.settings.dto';
 import { getValidationSchemas } from '@gitroom/nestjs-libraries/chat/validation.schemas.helper';
+import {
+  BadBody,
+  PublishedWithError,
+} from '@gitroom/nestjs-libraries/integrations/social.abstract';
 
 const baseSettings = {
   title: 'My video',
@@ -288,6 +292,34 @@ describe('YoutubeProvider category and playlist', () => {
       expect(result.status).toBe('completed');
       expect(log).toHaveBeenCalled();
       log.mockRestore();
+    });
+
+    it('still adds the video to the playlist when the thumbnail is rejected', async () => {
+      playlistItemsInsert.mockResolvedValue({ data: {} });
+      (provider as any).getSsrfSafeAxios = () =>
+        jest.fn().mockResolvedValue({ data: 'stream' });
+      (provider as any).runInConcurrent = jest
+        .fn()
+        .mockRejectedValue(new BadBody('youtube', '{}', '{}', 'rejected'));
+
+      await expect(
+        provider.finalizePost(
+          'token',
+          {
+            uploadUri: 'https://upload.example.com/session',
+            videoSize: 1000,
+            path: 'video.mp4',
+            uploadedBytes: 1000,
+            thumbnail: 'https://uploads.example.com/thumb.png',
+            playlistId: 'PL1',
+            videoId: 'video-1',
+            postDbId: 'post-1',
+          },
+          {} as any
+        )
+      ).rejects.toBeInstanceOf(PublishedWithError);
+
+      expect(playlistItemsInsert).toHaveBeenCalledTimes(1);
     });
 
     it('does not touch playlists when none is set', async () => {
