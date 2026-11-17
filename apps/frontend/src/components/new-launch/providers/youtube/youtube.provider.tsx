@@ -13,6 +13,7 @@ import { useWatch } from 'react-hook-form';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { Select } from '@gitroom/react/form/select';
 import { YoutubePreview } from '@gitroom/frontend/components/new-launch/providers/youtube/youtube.preview';
+import { YoutubeSelect } from '@gitroom/frontend/components/new-launch/providers/youtube/youtube.select';
 const type = [
   {
     label: 'Public',
@@ -71,6 +72,18 @@ const YoutubeSettings: FC = () => {
           </option>
         ))}
       </Select>
+      <YoutubeSelect
+        label={t('youtube_category', 'Category')}
+        emptyLabel={t('youtube_category_default', 'Channel default')}
+        method="categories"
+        {...register('categoryId')}
+      />
+      <YoutubeSelect
+        label={t('youtube_playlist', 'Playlist')}
+        emptyLabel={t('youtube_playlist_none', 'No playlist')}
+        method="playlists"
+        {...register('playlistId')}
+      />
       <MediumTags label="Tags" {...register('tags')} />
       {!!thumbnail?.path && (
         <div className="mt-[20px] flex items-center gap-[10px] text-[12px]">

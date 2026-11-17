@@ -1049,5 +1049,9 @@
   "bd_tablet": "平板",
   "bd_tv": "電視",
   "bd_game_console": "遊戲主機",
-  "bd_unknown_platform": "未知"
+  "bd_unknown_platform": "未知",
+  "youtube_category": "類別",
+  "youtube_category_default": "頻道預設",
+  "youtube_playlist": "播放清單",
+  "youtube_playlist_none": "不加入播放清單"
 }

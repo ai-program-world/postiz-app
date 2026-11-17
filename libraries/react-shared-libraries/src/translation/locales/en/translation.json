@@ -1049,5 +1049,9 @@
   "bd_tablet": "Tablet",
   "bd_tv": "TV",
   "bd_game_console": "Game Console",
-  "bd_unknown_platform": "Unknown"
+  "bd_unknown_platform": "Unknown",
+  "youtube_category": "Category",
+  "youtube_category_default": "Channel default",
+  "youtube_playlist": "Playlist",
+  "youtube_playlist_none": "No playlist"
 }
