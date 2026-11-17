@@ -14,7 +14,8 @@ export class MediaListTool implements AgentToolInterface {
     return createTool({
       id: 'mediaListTool',
       description: `List the media (images and videos) already uploaded to the media library, newest first, 18 per page, optionally searched by original filename.
-Use the returned path as an attachment URL in integrationSchedulePostTool instead of uploading the file again.`,
+Use the returned path as an attachment URL in integrationSchedulePostTool instead of uploading the file again.
+.mp3 audio files are never attachments, they only go in provider settings that ask for audio (like Transistor "audio").`,
       inputSchema: z.object({
         search: z
           .string()

@@ -1057,5 +1057,9 @@
   "bd_tap_back": "點擊返回",
   "bd_tap_exit": "離開",
   "bd_swipe_forward": "滑到下一個帳號",
-  "bd_automatic_forward": "自動前進"
+  "bd_automatic_forward": "自動前進",
+  "youtube_category": "類別",
+  "youtube_category_default": "頻道預設",
+  "youtube_playlist": "播放清單",
+  "youtube_playlist_none": "不加入播放清單"
 }

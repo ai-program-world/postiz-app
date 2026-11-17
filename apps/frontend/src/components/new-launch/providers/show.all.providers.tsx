@@ -34,6 +34,8 @@ import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { PostComment } from '@gitroom/frontend/components/new-launch/providers/high.order.provider';
 import WordpressProvider from '@gitroom/frontend/components/new-launch/providers/wordpress/wordpress.provider';
 import ListmonkProvider from '@gitroom/frontend/components/new-launch/providers/listmonk/listmonk.provider';
+import TransistorProvider from '@gitroom/frontend/components/new-launch/providers/transistor/transistor.provider';
+import PodbeanProvider from '@gitroom/frontend/components/new-launch/providers/podbean/podbean.provider';
 import GmbProvider from '@gitroom/frontend/components/new-launch/providers/gmb/gmb.provider';
 import MoltbookProvider from '@gitroom/frontend/components/new-launch/providers/moltbook/moltbook.provider';
 import SkoolProvider from '@gitroom/frontend/components/new-launch/providers/skool/skool.provider';
@@ -157,6 +159,14 @@ export const Providers = [
   {
     identifier: 'listmonk',
     component: ListmonkProvider,
+  },
+  {
+    identifier: 'transistor',
+    component: TransistorProvider,
+  },
+  {
+    identifier: 'podbean',
+    component: PodbeanProvider,
   },
   {
     identifier: 'gmb',

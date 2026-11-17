@@ -210,12 +210,33 @@ export const showMediaBox = (
 ) => {
   showModalEmitter.emit('show-modal', callback);
 };
+const AudioTile: FC = () => {
+  return (
+    <div className="w-full h-full flex items-center justify-center bg-newSep">
+      <svg
+        width="40"
+        height="40"
+        viewBox="0 0 24 24"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <path
+          d="M9 18V5L21 3V16M9 18C9 19.6569 7.65685 21 6 21C4.34315 21 3 19.6569 3 18C3 16.3431 4.34315 15 6 15C7.65685 15 9 16.3431 9 18ZM21 16C21 17.6569 19.6569 19 18 19C16.3431 19 15 17.6569 15 16C15 14.3431 16.3431 13 18 13C19.6569 13 21 14.3431 21 16Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    </div>
+  );
+};
 const CHUNK_SIZE = 1024 * 1024;
 const MAX_UPLOAD_SIZE = 1024 * 1024 * 1024; // 1 GB
 export const MediaBox: FC<{
   setMedia: (params: { id: string; path: string }[]) => void;
   standalone?: boolean;
-  type?: 'image' | 'image-static' | 'video';
+  type?: 'image' | 'image-static' | 'video' | 'audio';
   closeModal: () => void;
 }> = ({ type, standalone, setMedia }) => {
   const [page, setPage] = useState(0);
@@ -252,6 +273,10 @@ export const MediaBox: FC<{
         ? 'image/jpeg,image/png'
         : type == 'video'
         ? 'video/mp4'
+        : type == 'audio'
+        ? 'audio/mpeg'
+        : standalone
+        ? 'image/*,video/mp4,audio/mpeg'
         : 'image/*,video/mp4',
     onUploadSuccess: async (arr) => {
       await mutate();
@@ -383,6 +408,13 @@ export const MediaBox: FC<{
               <VideoFrame
                 autoplay={true}
                 url={mediaDirectory.set(media.path)}
+              />
+            ) : hasExtension(media.path, 'mp3') ? (
+              <audio
+                className="w-full"
+                controls={true}
+                autoPlay={true}
+                src={mediaDirectory.set(media.path)}
               />
             ) : (
               <img
@@ -606,6 +638,13 @@ export const MediaBox: FC<{
             )}
             {data?.results
               ?.filter((f: any) => {
+                // audio is only picked where a provider asks for it
+                if (type === 'audio') {
+                  return hasExtension(f.path, 'mp3');
+                }
+                if (!standalone && hasExtension(f.path, 'mp3')) {
+                  return false;
+                }
                 if (type === 'video') {
                   return hasExtension(f.path, 'mp4');
                 } else if (type === 'image') {
@@ -682,6 +721,8 @@ export const MediaBox: FC<{
                       </div>
                       {hasExtension(media.path, 'mp4') ? (
                         <VideoFrame url={mediaDirectory.set(media.path)} />
+                      ) : hasExtension(media.path, 'mp3') ? (
+                        <AudioTile />
                       ) : (
                         <img
                           width="100%"
@@ -1051,7 +1092,7 @@ export const MediaComponent: FC<{
       };
     };
   }) => void;
-  type?: 'image' | 'video';
+  type?: 'image' | 'video' | 'audio';
   width?: number;
   height?: number;
 }> = (props) => {
@@ -1124,7 +1165,14 @@ export const MediaComponent: FC<{
     <div className="flex flex-col gap-[8px]">
       <div className="text-[14px]">{label}</div>
       <div className="text-[12px]">{description}</div>
-      {!!currentMedia && (
+      {!!currentMedia && type === 'audio' && (
+        <audio
+          className="my-[20px] w-full max-w-[400px]"
+          controls={true}
+          src={mediaDirectory.set(currentMedia.path)}
+        />
+      )}
+      {!!currentMedia && type !== 'audio' && (
         <div className="my-[20px] cursor-pointer w-[200px] h-[200px] border-2 border-tableBorder">
           <img
             className="w-full h-full object-cover"
@@ -1135,12 +1183,14 @@ export const MediaComponent: FC<{
       )}
       <div className="flex gap-[5px]">
         <Button onClick={showModal}>{t('select', 'Select')}</Button>
-        <Button
-          onClick={showDesignModal}
-          className="!bg-customColor45 mobile:hidden"
-        >
-          {t('editor', 'Editor')}
-        </Button>
+        {type !== 'audio' && (
+          <Button
+            onClick={showDesignModal}
+            className="!bg-customColor45 mobile:hidden"
+          >
+            {t('editor', 'Editor')}
+          </Button>
+        )}
         <Button secondary={true} onClick={clearMedia}>
           {t('clear', 'Clear')}
         </Button>

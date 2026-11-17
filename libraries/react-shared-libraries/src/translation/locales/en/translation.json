@@ -1057,5 +1057,9 @@
   "bd_tap_back": "Tap Back",
   "bd_tap_exit": "Exit",
   "bd_swipe_forward": "Swipe to Next Account",
-  "bd_automatic_forward": "Auto Forward"
+  "bd_automatic_forward": "Auto Forward",
+  "youtube_category": "Category",
+  "youtube_category_default": "Channel default",
+  "youtube_playlist": "Playlist",
+  "youtube_playlist_none": "No playlist"
 }

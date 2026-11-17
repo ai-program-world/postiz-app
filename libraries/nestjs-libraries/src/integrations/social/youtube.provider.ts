@@ -37,6 +37,7 @@ import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/s
 import { setHeartbeatDetails } from '@gitroom/nestjs-libraries/temporal/temporal.heartbeat';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
 import { DashboardFunction } from '@gitroom/nestjs-libraries/integrations/dashboard.function.decorator';
+import { Tool } from '@gitroom/nestjs-libraries/integrations/tool.decorator';
 
 const clientAndYoutube = () => {
   const client = new google.auth.OAuth2({
@@ -424,6 +425,73 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
     }
   }
 
+  @Tool({
+    description:
+      'List of video categories that can be assigned to an upload, pass the id as the "categoryId" setting',
+    dataSchema: [],
+  })
+  async categories(accessToken: string) {
+    const { client, youtube } = clientAndYoutube();
+    client.setCredentials({ access_token: accessToken });
+
+    try {
+      const { data } = await youtube(client).videoCategories.list({
+        part: ['snippet'],
+        regionCode: 'TW',
+        hl: 'zh-TW',
+      });
+
+      return (data.items || [])
+        .filter((p) => p.snippet?.assignable)
+        .map((p) => ({ id: p.id!, name: p.snippet?.title || p.id! }));
+    } catch (err) {
+      this.rethrowYoutubeAuthError(err);
+      throw err;
+    }
+  }
+
+  @Tool({
+    description:
+      'List of the channel playlists, pass the id as the "playlistId" setting to add the video to it after the upload',
+    dataSchema: [],
+  })
+  async playlists(accessToken: string) {
+    const { client, youtube } = clientAndYoutube();
+    client.setCredentials({ access_token: accessToken });
+
+    const list: Array<{ id: string; name: string }> = [];
+    let pageToken: string | undefined;
+
+    try {
+      // a few pages are enough for any real channel, and keep the quota low
+      for (let page = 0; page < 10; page++) {
+        const { data } = await youtube(client).playlists.list({
+          part: ['snippet'],
+          mine: true,
+          maxResults: 50,
+          ...(pageToken ? { pageToken } : {}),
+        });
+
+        list.push(
+          ...(data.items || []).map((p) => ({
+            id: p.id!,
+            name: p.snippet?.title || p.id!,
+          }))
+        );
+
+        pageToken = data.nextPageToken || undefined;
+        if (!pageToken) {
+          break;
+        }
+      }
+    } catch (err) {
+      this.rethrowYoutubeAuthError(err);
+      throw err;
+    }
+
+    return list;
+  }
+
   async reConnect(
     id: string,
     requiredId: string,
@@ -628,6 +696,10 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
             ...(settings?.tags?.length
               ? { tags: settings.tags.map((p) => p.label) }
               : {}),
+            // no category keeps the channel default
+            ...(settings?.categoryId
+              ? { categoryId: settings.categoryId }
+              : {}),
           },
           status: {
             privacyStatus: settings.type,
@@ -662,6 +734,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
           // with the one they always had
           thumbnail:
             settings?.thumbnail?.path || firstPost?.media?.[0]?.thumbnail || '',
+          playlistId: settings?.playlistId || '',
           postDbId: firstPost.id,
         },
       },
@@ -676,6 +749,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       path: string;
       uploadedBytes: number;
       thumbnail: string;
+      playlistId?: string;
       videoId?: string;
       postDbId?: string;
     },
@@ -697,9 +771,10 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       return { status: 'pending', pendingData };
     }
 
-    // the upload completed: the video exists, only the thumbnail may be left
+    // the upload completed: the video exists, only the thumbnail and the
+    // playlist may be left
     if ('videoId' in probe) {
-      if (pendingData.thumbnail) {
+      if (pendingData.thumbnail || pendingData.playlistId) {
         return {
           status: 'ready',
           pendingData: { ...pendingData, videoId: probe.videoId },
@@ -728,6 +803,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       path: string;
       uploadedBytes: number;
       thumbnail: string;
+      playlistId?: string;
       videoId?: string;
       postDbId?: string;
     },
@@ -869,6 +945,14 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         // and URL (a token problem is left to the refresh + retry path, the
         // thumbnail call is idempotent)
         if (err instanceof BadBody && pendingData.postDbId) {
+          // a rejected thumbnail ends the post here, still file the video
+          if (pendingData.playlistId) {
+            await this.addToPlaylist(
+              accessToken,
+              videoId,
+              pendingData.playlistId
+            );
+          }
           throw new PublishedWithError(
             this.identifier,
             pendingData.postDbId,
@@ -881,11 +965,49 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       }
     }
 
+    // last step on purpose: nothing after it throws, so an error retry of this
+    // activity does not add the video twice (only an activity timeout right
+    // after the insert could)
+    if (pendingData.playlistId) {
+      await this.addToPlaylist(accessToken, videoId, pendingData.playlistId);
+    }
+
     return {
       status: 'completed',
       postId: videoId,
       releaseURL,
     };
+  }
+
+  // The video is already published: a missing playlist, a removed permission
+  // or any other error is only logged and never fails the post.
+  private async addToPlaylist(
+    accessToken: string,
+    videoId: string,
+    playlistId: string
+  ) {
+    try {
+      const { client, youtube } = clientAndYoutube();
+      client.setCredentials({ access_token: accessToken });
+
+      await youtube(client).playlistItems.insert({
+        part: ['snippet'],
+        requestBody: {
+          snippet: {
+            playlistId,
+            resourceId: {
+              kind: 'youtube#video',
+              videoId,
+            },
+          },
+        },
+      });
+    } catch (err: any) {
+      console.error(
+        `YouTube: failed to add video ${videoId} to playlist ${playlistId}`,
+        JSON.stringify(err?.response?.data || err?.message || err)
+      );
+    }
   }
 
   // Old blocking behavior, kept for workflow versions before v1.0.6 that still
