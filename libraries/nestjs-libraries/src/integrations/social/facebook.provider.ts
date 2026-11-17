@@ -156,7 +156,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       return {
         type: 'bad-body' as const,
         value: 'Invalid file',
-      }
+      };
     }
 
     if (body.indexOf('1404102') > -1) {
@@ -838,6 +838,59 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     }
   }
 
+  // The video edge takes the cover only as raw image data (`thumb`), never as
+  // a URL, so a video with a cover (picked frame or uploaded image) goes out
+  // as multipart. Without a cover the body stays the JSON it always was.
+  private async videoUploadBody(
+    firstPost: PostDetails<FacebookDto>
+  ): Promise<Pick<RequestInit, 'headers' | 'body'>> {
+    const fields = {
+      file_url: firstPost?.media?.[0]?.path!,
+      description: firstPost.message,
+      ...(firstPost?.settings?.title
+        ? { title: firstPost.settings.title }
+        : {}),
+      published: true,
+    };
+
+    const jsonBody = {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(fields),
+    };
+
+    const thumbnail = firstPost?.media?.[0]?.thumbnail;
+    if (!thumbnail) {
+      return jsonBody;
+    }
+
+    let cover: Buffer;
+    try {
+      cover = await this.readOrFetch(thumbnail);
+    } catch (err) {
+      // a cover that can't be read must not block the video itself
+      console.error(
+        'Facebook: could not read the video cover, posting without it',
+        err
+      );
+      return jsonBody;
+    }
+
+    const isPng = hasExtension(thumbnail, 'png');
+    const form = new FormData();
+    Object.entries(fields).forEach(([key, value]) => {
+      form.append(key, String(value));
+    });
+    form.append(
+      'thumb',
+      new Blob([cover], { type: isPng ? 'image/png' : 'image/jpeg' }),
+      isPng ? 'thumbnail.png' : 'thumbnail.jpg'
+    );
+
+    return { body: form };
+  }
+
   private async postNonStory(
     id: string,
     accessToken: string,
@@ -857,17 +910,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
           `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/videos?access_token=${accessToken}&fields=id,permalink_url`,
           {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              file_url: firstPost?.media?.[0]?.path!,
-              description: firstPost.message,
-              ...(firstPost?.settings?.title
-                ? { title: firstPost.settings.title }
-                : {}),
-              published: true,
-            }),
+            ...(await this.videoUploadBody(firstPost)),
           },
           'upload mp4'
         )
@@ -1201,8 +1244,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
             : computeSeriesTrend(pts, 'sum'),
         aggregation: 'sum',
         unit: 'number',
-        category:
-          name === 'page_post_engagements' ? 'engagement' : 'overview',
+        category: name === 'page_post_engagements' ? 'engagement' : 'overview',
         data: pts,
       });
     }
@@ -1502,44 +1544,44 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
             // metric can't fail the whole call and blank the view counts.
             const [viewsRes, insRes, countsRes, watchRes, retention] =
               await Promise.all([
-              safeAnalyticsCall(
-                `fb.post.views.${p.id}`,
-                () =>
-                  this.fetchFbJson(
-                    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_media_view,post_total_media_view_unique&access_token=${accessToken}`
-                  ),
-                null
-              ),
-              safeAnalyticsCall(
-                `fb.post.ins.${p.id}`,
-                () =>
-                  this.fetchFbJson(
-                    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_clicks,post_reactions_by_type_total&access_token=${accessToken}`
-                  ),
-                null
-              ),
-              safeAnalyticsCall(
-                `fb.post.counts.${p.id}`,
-                () =>
-                  this.fetchFbJson(
-                    `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}?fields=comments.summary(true).limit(0)&access_token=${accessToken}`
-                  ),
-                null
-              ),
-              videoId
-                ? safeAnalyticsCall(
-                    `fb.post.watch_time.${p.id}`,
-                    () =>
-                      this.fetchFbJson(
-                        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=post_video_avg_time_watched&access_token=${accessToken}`
-                      ),
-                    null
-                  )
-                : Promise.resolve(null),
-              videoId
-                ? this.fetchVideoRetention(accessToken, videoId)
-                : Promise.resolve(null),
-            ]);
+                safeAnalyticsCall(
+                  `fb.post.views.${p.id}`,
+                  () =>
+                    this.fetchFbJson(
+                      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_media_view,post_total_media_view_unique&access_token=${accessToken}`
+                    ),
+                  null
+                ),
+                safeAnalyticsCall(
+                  `fb.post.ins.${p.id}`,
+                  () =>
+                    this.fetchFbJson(
+                      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_clicks,post_reactions_by_type_total&access_token=${accessToken}`
+                    ),
+                  null
+                ),
+                safeAnalyticsCall(
+                  `fb.post.counts.${p.id}`,
+                  () =>
+                    this.fetchFbJson(
+                      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}?fields=comments.summary(true).limit(0)&access_token=${accessToken}`
+                    ),
+                  null
+                ),
+                videoId
+                  ? safeAnalyticsCall(
+                      `fb.post.watch_time.${p.id}`,
+                      () =>
+                        this.fetchFbJson(
+                          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=post_video_avg_time_watched&access_token=${accessToken}`
+                        ),
+                      null
+                    )
+                  : Promise.resolve(null),
+                videoId
+                  ? this.fetchVideoRetention(accessToken, videoId)
+                  : Promise.resolve(null),
+              ]);
             const avgWatchMs = watchRes?.data?.[0]?.values?.[0]?.value;
             const curve = retention
               ? this.parseRetentionCurve(retention.value, retention.lengthSec)
@@ -1744,7 +1786,9 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
 
       const commentsCount = nodeRes?.comments?.summary?.total_count;
       // Graph omits `shares` entirely when a post has no shares
-      const sharesCount = nodeRes ? Number(nodeRes?.shares?.count) || 0 : undefined;
+      const sharesCount = nodeRes
+        ? Number(nodeRes?.shares?.count) || 0
+        : undefined;
 
       if (commentsCount !== undefined) {
         result.push({
@@ -1834,7 +1878,8 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     const lengthSec = Number(nodeRes?.length);
     return {
       value,
-      lengthSec: Number.isFinite(lengthSec) && lengthSec > 0 ? lengthSec : undefined,
+      lengthSec:
+        Number.isFinite(lengthSec) && lengthSec > 0 ? lengthSec : undefined,
     };
   }
 
@@ -1843,7 +1888,10 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
    * buckets across the video, as a 0-1 share or a 0-100 percent) into percent
    * points, plus the share still watching at 3 seconds and at the end.
    */
-  private parseRetentionCurve(value: Record<string, number>, lengthSec?: number) {
+  private parseRetentionCurve(
+    value: Record<string, number>,
+    lengthSec?: number
+  ) {
     const entries = Object.entries(value)
       .map(([k, v]) => ({ idx: Number(k), val: Number(v) }))
       .filter((e) => Number.isFinite(e.idx) && Number.isFinite(e.val))
@@ -1875,7 +1923,8 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
         const a = entries[after - 1];
         const b = entries[after];
         const ratio = (target - a.idx) / (b.idx - a.idx || 1);
-        retention3sRate = pct[after - 1] + (pct[after] - pct[after - 1]) * ratio;
+        retention3sRate =
+          pct[after - 1] + (pct[after] - pct[after - 1]) * ratio;
       }
       retention3sRate = Number(retention3sRate.toFixed(1));
     }
@@ -1970,7 +2019,10 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
             break;
           case 'total_video_reactions_by_type_total':
           case 'post_video_likes_by_reaction_type':
-            if (typeof value === 'object' && !result.some((r) => r.label === 'Reactions')) {
+            if (
+              typeof value === 'object' &&
+              !result.some((r) => r.label === 'Reactions')
+            ) {
               const bd = buildBreakdown(value as Record<string, number>, 10);
               totalReactions = Object.values(
                 value as Record<string, number>
@@ -2087,9 +2139,10 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
             {
               total: String(
                 Number(
-                  (((totalReactions + totalActions) / playsOrViews) * 100).toFixed(
-                    2
-                  )
+                  (
+                    ((totalReactions + totalActions) / playsOrViews) *
+                    100
+                  ).toFixed(2)
                 )
               ),
               date: today,
@@ -2099,7 +2152,10 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       }
 
       const curve = retentionGraph
-        ? this.parseRetentionCurve(retentionGraph.value, retentionGraph.lengthSec)
+        ? this.parseRetentionCurve(
+            retentionGraph.value,
+            retentionGraph.lengthSec
+          )
         : null;
       if (curve) {
         result.push({
