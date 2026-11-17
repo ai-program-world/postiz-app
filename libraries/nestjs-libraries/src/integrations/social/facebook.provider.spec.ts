@@ -4,7 +4,10 @@ jest.mock('@gitroom/nestjs-libraries/temporal/temporal.heartbeat', () => ({
   setHeartbeatDetails: jest.fn(),
 }));
 
+import sharp from 'sharp';
+import { ApplicationFailure } from '@temporalio/common';
 import { FacebookProvider } from './facebook.provider';
+import { BadBody } from '@gitroom/nestjs-libraries/integrations/social.abstract';
 
 const videoPost = (media: any, settings: any = {}) =>
   [
@@ -17,6 +20,13 @@ const videoPost = (media: any, settings: any = {}) =>
   ] as any;
 
 const integration = { id: 'integration-1', internalId: 'page-1' } as any;
+
+const image = (format: 'png' | 'webp', width = 64, height = 36) =>
+  sharp({
+    create: { width, height, channels: 3, background: '#ff0000' },
+  })
+    .toFormat(format)
+    .toBuffer();
 
 const mockVideoUpload = (provider: FacebookProvider) => {
   const fetchMock = jest.fn().mockResolvedValue({
@@ -64,9 +74,7 @@ describe('FacebookProvider video cover', () => {
 
   it('sends the cover as the thumb image of a multipart upload', async () => {
     const fetchMock = mockVideoUpload(provider);
-    const readOrFetch = jest
-      .fn()
-      .mockResolvedValue(Buffer.from('cover-image-bytes'));
+    const readOrFetch = jest.fn().mockResolvedValue(await image('png'));
     (provider as any).readOrFetch = readOrFetch;
 
     await provider.post(
@@ -97,9 +105,90 @@ describe('FacebookProvider video cover', () => {
     const thumb = form.get('thumb') as File;
     expect(thumb.name).toBe('thumbnail.jpg');
     expect(thumb.type).toBe('image/jpeg');
-    expect(Buffer.from(await thumb.arrayBuffer()).toString()).toBe(
-      'cover-image-bytes'
+    // the cover is always re-encoded as a JPEG
+    const meta = await sharp(Buffer.from(await thumb.arrayBuffer())).metadata();
+    expect(meta.format).toBe('jpeg');
+  });
+
+  it('converts a webp cover to JPEG and downscales a large one', async () => {
+    const fetchMock = mockVideoUpload(provider);
+    (provider as any).readOrFetch = jest
+      .fn()
+      .mockResolvedValue(await image('webp', 4000, 2250));
+
+    await provider.post(
+      'page-1',
+      'token',
+      videoPost({
+        path: 'https://uploads.example.com/video.mp4',
+        thumbnail: 'https://uploads.example.com/cover.webp',
+      }),
+      integration
     );
+
+    const thumb = (fetchMock.mock.calls[0][1].body as FormData).get(
+      'thumb'
+    ) as File;
+    const meta = await sharp(Buffer.from(await thumb.arrayBuffer())).metadata();
+    expect(meta.format).toBe('jpeg');
+    expect(meta.width).toBe(1920);
+    expect(meta.height).toBe(1080);
+  });
+
+  it('publishes the video without the cover when Facebook rejects it', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const fetchMock = jest
+      .fn()
+      .mockRejectedValueOnce(
+        new BadBody('upload mp4', '{"error":{"code":100}}', '{}', 'bad thumb')
+      )
+      .mockResolvedValueOnce({
+        json: async () => ({ id: 'video-1', permalink_url: '/reel/video-1' }),
+      });
+    (provider as any).fetch = fetchMock;
+    (provider as any).readOrFetch = jest.fn().mockResolvedValue(await image('png'));
+
+    const [result] = await provider.post(
+      'page-1',
+      'token',
+      videoPost({
+        path: 'https://uploads.example.com/video.mp4',
+        thumbnail: 'https://uploads.example.com/cover.png',
+      }),
+      integration
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][1].body).toBeInstanceOf(FormData);
+    const [, retry] = fetchMock.mock.calls[1];
+    expect(retry.headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(JSON.parse(retry.body).file_url).toBe(
+      'https://uploads.example.com/video.mp4'
+    );
+    expect(result.postId).toBe('video-1');
+  });
+
+  it('does not retry without the cover on a token error', async () => {
+    const tokenError = ApplicationFailure.create({
+      message: 'token expired',
+      type: 'refresh_token',
+    });
+    const fetchMock = jest.fn().mockRejectedValue(tokenError);
+    (provider as any).fetch = fetchMock;
+    (provider as any).readOrFetch = jest.fn().mockResolvedValue(await image('png'));
+
+    await expect(
+      provider.post(
+        'page-1',
+        'token',
+        videoPost({
+          path: 'https://uploads.example.com/video.mp4',
+          thumbnail: 'https://uploads.example.com/cover.png',
+        }),
+        integration
+      )
+    ).rejects.toBe(tokenError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('posts the video without a cover when the cover cannot be read', async () => {
