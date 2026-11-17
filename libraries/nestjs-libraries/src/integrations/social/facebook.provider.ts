@@ -34,6 +34,7 @@ import {
 import { DribbbleDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/dribbble.dto';
 import { Integration } from '@prisma/client';
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
+import sharp from 'sharp';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
 import { DashboardFunction } from '@gitroom/nestjs-libraries/integrations/dashboard.function.decorator';
@@ -838,6 +839,87 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     }
   }
 
+  // The video edge takes the cover only as raw image data (`thumb`), never as
+  // a URL, so a video with a cover (picked frame or uploaded image) goes out
+  // as multipart. Without a cover the body stays the JSON it always was.
+  private async videoUploadBody(
+    firstPost: PostDetails<FacebookDto>,
+    withCover: boolean
+  ): Promise<Pick<RequestInit, 'headers' | 'body'>> {
+    const fields = {
+      file_url: firstPost?.media?.[0]?.path!,
+      description: firstPost.message,
+      ...(firstPost?.settings?.title ? { title: firstPost.settings.title } : {}),
+      published: true,
+    };
+
+    const jsonBody = {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(fields),
+    };
+
+    const thumbnail = firstPost?.media?.[0]?.thumbnail;
+    if (!withCover || !thumbnail) {
+      return jsonBody;
+    }
+
+    let cover: Buffer;
+    try {
+      // A gallery cover can be webp, gif or a full-size original (the frontend
+      // skips compression when server-side media processing is on), so every
+      // cover is re-encoded as a downscaled JPEG that Facebook accepts.
+      cover = await sharp(await this.readOrFetch(thumbnail), {
+        animated: false,
+      })
+        .resize({
+          width: 1920,
+          height: 1920,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+        .jpeg({ quality: 90 })
+        .toBuffer();
+    } catch (err) {
+      // a cover that can't be read must not block the video itself
+      console.error(
+        'Facebook: could not read the video cover, posting without it',
+        err
+      );
+      return jsonBody;
+    }
+
+    const form = new FormData();
+    Object.entries(fields).forEach(([key, value]) => {
+      form.append(key, String(value));
+    });
+    form.append(
+      'thumb',
+      new Blob([cover], { type: 'image/jpeg' }),
+      'thumbnail.jpg'
+    );
+
+    return { body: form };
+  }
+
+  private async uploadVideo(
+    id: string,
+    accessToken: string,
+    body: Pick<RequestInit, 'headers' | 'body'>
+  ) {
+    return (
+      await this.fetch(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/videos?access_token=${accessToken}&fields=id,permalink_url`,
+        {
+          method: 'POST',
+          ...body,
+        },
+        'upload mp4'
+      )
+    ).json();
+  }
+
   private async postNonStory(
     id: string,
     accessToken: string,
@@ -848,30 +930,50 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     let finalId = '';
     let finalUrl = '';
     if (hasExtension(firstPost?.media?.[0]?.path, 'mp4')) {
-      const {
-        id: videoId,
-        permalink_url,
-        ...all
-      } = await (
-        await this.fetch(
-          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/videos?access_token=${accessToken}&fields=id,permalink_url`,
+      const body = await this.videoUploadBody(firstPost, true);
+      // false when there is no cover, or it could not be read and the body
+      // already fell back to JSON - a retry would only resend the same request
+      const coverAttached = body.body instanceof FormData;
+
+      // Facebook can reject the cover image itself and fail the whole upload.
+      // The cover is optional, so the video is published once more without it,
+      // but only on an invalid-parameter / thumb error: never on a token or
+      // permission error, and never on a generic or server error, where the
+      // video may already exist and a second upload would publish it twice.
+      const isCoverRejection = (err: any): boolean => {
+        const detail = `${err?.details?.[0]?.json ?? ''} ${err?.message ?? ''}`;
+        if (
+          /access token|re-authenticate|revoked|permission|"code":\s*(190|200)\b/i.test(
+            detail
+          )
+        ) {
+          return false;
+        }
+        return /thumb/i.test(detail) || /"code":\s*100\b/.test(detail);
+      };
+
+      let videoResult: any;
+      try {
+        videoResult = await this.uploadVideo(id, accessToken, body);
+      } catch (err) {
+        if (!coverAttached || !isCoverRejection(err)) {
+          throw err;
+        }
+        console.warn(
+          'Facebook rejected the video upload with a cover, publishing it without the cover',
           {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              file_url: firstPost?.media?.[0]?.path!,
-              description: firstPost.message,
-              ...(firstPost?.settings?.title
-                ? { title: firstPost.settings.title }
-                : {}),
-              published: true,
-            }),
-          },
-          'upload mp4'
-        )
-      ).json();
+            facebook: (err as any)?.details?.[0]?.json,
+            message: (err as any)?.message,
+          }
+        );
+        videoResult = await this.uploadVideo(
+          id,
+          accessToken,
+          await this.videoUploadBody(firstPost, false)
+        );
+      }
+
+      const { id: videoId, permalink_url, ...all } = videoResult;
 
       finalUrl = 'https://www.facebook.com/reel/' + videoId;
       finalId = videoId;
