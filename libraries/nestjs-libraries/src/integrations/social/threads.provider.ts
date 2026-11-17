@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   AnalyticsPostItem,
+  AnalyticsSnapshotData,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -1186,6 +1187,47 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     }
 
     return false;
+  }
+
+  async analyticsSnapshot(
+    id: string,
+    accessToken: string
+  ): Promise<AnalyticsSnapshotData | undefined> {
+    const res = await this.fetchThreadsJson(
+      `https://graph.threads.net/v1.0/${id}/threads_insights?metric=followers_count&access_token=${accessToken}`
+    );
+    const item = res?.data?.find((d: any) => d.name === 'followers_count');
+    const followers = item?.total_value?.value ?? item?.values?.[0]?.value;
+
+    // follower_demographics needs >= 100 followers, so each one may be empty
+    const demographics: Record<string, Record<string, number>> = {};
+    for (const breakdown of ['country', 'city', 'age', 'gender']) {
+      const demo = await safeAnalyticsCall(
+        `threads.snapshot.${breakdown}`,
+        () =>
+          this.fetchThreadsJson(
+            `https://graph.threads.net/v1.0/${id}/threads_insights?metric=follower_demographics&breakdown=${breakdown}&access_token=${accessToken}`
+          ),
+        null
+      );
+      const map: Record<string, number> = {};
+      for (const row of demo?.data?.[0]?.total_value?.breakdowns?.[0]
+        ?.results || []) {
+        const dim = (row.dimension_values || []).join(' ');
+        if (dim) {
+          map[dim] = (map[dim] || 0) + (Number(row.value) || 0);
+        }
+      }
+      if (Object.keys(map).length > 0) {
+        demographics[breakdown] = map;
+      }
+    }
+
+    return {
+      followers: followers !== undefined ? Number(followers) || 0 : undefined,
+      demographics:
+        Object.keys(demographics).length > 0 ? demographics : undefined,
+    };
   }
 
   async postAnalytics(

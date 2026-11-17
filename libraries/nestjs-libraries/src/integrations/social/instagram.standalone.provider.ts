@@ -300,4 +300,20 @@ export class InstagramStandaloneProvider
       'graph.instagram.com'
     );
   }
+
+  async analyticsSnapshot(id: string, accessToken: string) {
+    return instagramProvider.analyticsSnapshot(
+      id,
+      accessToken,
+      'graph.instagram.com'
+    );
+  }
+
+  async storyInsights(id: string, accessToken: string) {
+    return instagramProvider.storyInsights(
+      id,
+      accessToken,
+      'graph.instagram.com'
+    );
+  }
 }

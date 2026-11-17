@@ -149,6 +149,9 @@ const METRIC_LABEL_KEYS: Record<string, string> = {
   'Clicks by Link': 'metric_clicks_by_link',
   'Traffic Sources': 'metric_traffic_sources',
   'Recent Posts Performance': 'metric_recent_posts_performance',
+  'Stories Performance': 'metric_stories_performance',
+  'Story Navigation': 'metric_story_navigation',
+  'Follower History': 'metric_follower_history',
   'Top Videos Performance': 'metric_top_videos_performance',
 };
 
@@ -208,6 +211,11 @@ const BREAKDOWN_VALUE_KEYS: Record<string, string> = {
   TV: 'bd_tv',
   'Game Console': 'bd_game_console',
   Unknown: 'bd_unknown_platform',
+  TAP_FORWARD: 'bd_tap_forward',
+  TAP_BACK: 'bd_tap_back',
+  TAP_EXIT: 'bd_tap_exit',
+  SWIPE_FORWARD: 'bd_swipe_forward',
+  AUTOMATIC_FORWARD: 'bd_automatic_forward',
 };
 
 export function translateMetricLabel(
