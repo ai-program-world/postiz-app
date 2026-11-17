@@ -168,6 +168,34 @@ describe('FacebookProvider video cover', () => {
     expect(result.postId).toBe('video-1');
   });
 
+  it('does not retry without the cover on a generic or permission error', async () => {
+    const fetchMock = jest
+      .fn()
+      .mockRejectedValue(
+        new BadBody(
+          'upload mp4',
+          '{"error":{"code":200,"message":"(#200) Permissions error"}}',
+          '{}',
+          'Unknown Error'
+        )
+      );
+    (provider as any).fetch = fetchMock;
+    (provider as any).readOrFetch = jest.fn().mockResolvedValue(await image('png'));
+
+    await expect(
+      provider.post(
+        'page-1',
+        'token',
+        videoPost({
+          path: 'https://uploads.example.com/video.mp4',
+          thumbnail: 'https://uploads.example.com/cover.png',
+        }),
+        integration
+      )
+    ).rejects.toBeInstanceOf(BadBody);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('does not retry without the cover on a token error', async () => {
     const tokenError = ApplicationFailure.create({
       message: 'token expired',

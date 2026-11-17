@@ -844,7 +844,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
   // as multipart. Without a cover the body stays the JSON it always was.
   private async videoUploadBody(
     firstPost: PostDetails<FacebookDto>,
-    withCover = true
+    withCover: boolean
   ): Promise<Pick<RequestInit, 'headers' | 'body'>> {
     const fields = {
       file_url: firstPost?.media?.[0]?.path!,
@@ -906,15 +906,14 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
   private async uploadVideo(
     id: string,
     accessToken: string,
-    firstPost: PostDetails<FacebookDto>,
-    withCover: boolean
+    body: Pick<RequestInit, 'headers' | 'body'>
   ) {
     return (
       await this.fetch(
         `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/videos?access_token=${accessToken}&fields=id,permalink_url`,
         {
           method: 'POST',
-          ...(await this.videoUploadBody(firstPost, withCover)),
+          ...body,
         },
         'upload mp4'
       )
@@ -931,20 +930,33 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     let finalId = '';
     let finalUrl = '';
     if (hasExtension(firstPost?.media?.[0]?.path, 'mp4')) {
-      const hasCover = !!firstPost?.media?.[0]?.thumbnail;
+      const body = await this.videoUploadBody(firstPost, true);
+      // false when there is no cover, or it could not be read and the body
+      // already fell back to JSON - a retry would only resend the same request
+      const coverAttached = body.body instanceof FormData;
+
+      // Facebook can reject the cover image itself and fail the whole upload.
+      // The cover is optional, so the video is published once more without it,
+      // but only on an invalid-parameter / thumb error: never on a token or
+      // permission error, and never on a generic or server error, where the
+      // video may already exist and a second upload would publish it twice.
+      const isCoverRejection = (err: any): boolean => {
+        const detail = `${err?.details?.[0]?.json ?? ''} ${err?.message ?? ''}`;
+        if (
+          /access token|re-authenticate|revoked|permission|"code":\s*(190|200)\b/i.test(
+            detail
+          )
+        ) {
+          return false;
+        }
+        return /thumb/i.test(detail) || /"code":\s*100\b/.test(detail);
+      };
+
       let videoResult: any;
       try {
-        videoResult = await this.uploadVideo(
-          id,
-          accessToken,
-          firstPost,
-          hasCover
-        );
+        videoResult = await this.uploadVideo(id, accessToken, body);
       } catch (err) {
-        // Facebook can reject the cover image itself and fail the whole upload.
-        // The cover is optional, so publish the video once more without it -
-        // but never on a token / permission error, a retry can't fix that.
-        if (!hasCover || (err as any)?.type !== 'bad_body') {
+        if (!coverAttached || !isCoverRejection(err)) {
           throw err;
         }
         console.warn(
@@ -954,7 +966,11 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
             message: (err as any)?.message,
           }
         );
-        videoResult = await this.uploadVideo(id, accessToken, firstPost, false);
+        videoResult = await this.uploadVideo(
+          id,
+          accessToken,
+          await this.videoUploadBody(firstPost, false)
+        );
       }
 
       const { id: videoId, permalink_url, ...all } = videoResult;
