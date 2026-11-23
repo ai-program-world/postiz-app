@@ -18,7 +18,8 @@ import {
 } from '@prisma/client';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
 import { GetPostsListDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.list.dto';
-import { groupBy, shuffle, uniqBy } from 'lodash';
+import { groupBy, shuffle, uniq, uniqBy } from 'lodash';
+import pLimit from 'p-limit';
 import { v4 as uuidv4 } from 'uuid';
 import { CreateGeneratedPostsDto } from '@gitroom/nestjs-libraries/dtos/generator/create.generated.posts.dto';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
@@ -412,6 +413,42 @@ export class PostsService {
     }
 
     return [];
+  }
+
+  async checkPostsAnalytics(
+    orgId: string,
+    postIds: string[],
+    date: number,
+    skipCache = false
+  ) {
+    const days = Number(date) > 0 ? Number(date) : 7;
+    const limit = pLimit(5);
+    const results = await Promise.all(
+      uniq(postIds).map((postId) =>
+        limit(async () => {
+          try {
+            const analytics = await this.checkPostAnalytics(
+              orgId,
+              postId,
+              days,
+              false,
+              skipCache
+            );
+            return { postId, analytics };
+          } catch (e) {
+            // one failing post must not fail the whole batch
+            console.log(e);
+            return {
+              postId,
+              analytics: [] as AnalyticsData[],
+              error: 'Could not load analytics for this post',
+            };
+          }
+        })
+      )
+    );
+
+    return { days, results };
   }
 
   async getStatistics(orgId: string, id: string) {

@@ -56,6 +56,7 @@ import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 import { AdminStatsService } from '@gitroom/nestjs-libraries/database/prisma/admin-stats/admin-stats.service';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { GetOrgActivityDto } from '@gitroom/nestjs-libraries/dtos/analytics/get.org.activity.dto';
+import { GetPostsAnalyticsDto } from '@gitroom/nestjs-libraries/dtos/analytics/get.posts.analytics.dto';
 import { ResetCreditsDto } from '@gitroom/nestjs-libraries/dtos/billing/reset.credits.dto';
 import { SubscriptionService } from '@gitroom/nestjs-libraries/database/prisma/subscriptions/subscription.service';
 import dayjs from 'dayjs';
@@ -713,6 +714,20 @@ export class PublicIntegrationsController {
       +date,
       false,
       skipCache
+    );
+  }
+
+  @Post('/analytics/posts')
+  async getPostsAnalytics(
+    @GetOrgFromRequest() org: Organization,
+    @Body() body: GetPostsAnalyticsDto
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this._postsService.checkPostsAnalytics(
+      org.id,
+      body.postIds,
+      body.date,
+      !!body.refresh
     );
   }
 
