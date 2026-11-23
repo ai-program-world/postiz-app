@@ -36,7 +36,7 @@ import { Tool } from '@gitroom/nestjs-libraries/integrations/tool.decorator';
   [
     'TikTok Business can have one video or one picture or multiple pictures (up to 35), it cannot be without an attachment.',
     'content_posting_method=DIRECT_POST publishes the post to the account. content_posting_method=UPLOAD does NOT publish: it only saves the media as a draft in the user inbox of the TikTok app, where the user must manually complete and publish it. Use DIRECT_POST unless the user explicitly asks to review or edit the post inside the TikTok app first.',
-    'With content_posting_method=UPLOAD, TikTok ignores every setting except the title / post content. Never tell the user that video_made_with_ai, privacy_level, duet, stitch, comment, autoAddMusic, brand_content_toggle or brand_organic_toggle will be applied in UPLOAD mode - they are silently discarded. If the user asks for any of those settings, tell them it requires DIRECT_POST.',
+    'With content_posting_method=UPLOAD, TikTok ignores every setting except the title / post content, and keeps those for photo posts only - a video arrives in the inbox without its caption (the description is empty or just "#Postiz"), so the user has to type the caption in the TikTok app. Never tell the user that video_made_with_ai, privacy_level, duet, stitch, comment, autoAddMusic, brand_content_toggle or brand_organic_toggle will be applied in UPLOAD mode - they are silently discarded. If the user asks for any of those settings, tell them it requires DIRECT_POST.',
     'video_made_with_ai, duet and stitch apply to video posts only. privacy_level and autoAddMusic apply to photo posts only - the TikTok Business API has no privacy field for video posts, so those settings are discarded when the attachment is a video.',
     'The music setting attaches a commercial music library track (found via the musicSearch function) to a video or photo post, and the location setting tags the post with a location (found via the locationSearch function). Both apply only with content_posting_method=DIRECT_POST. music.audio_volume / music.video_volume (0-100, default 50) apply to video posts only. For photos, autoAddMusic=yes attaches a RANDOM commercial music library track and overrides any music selection - use autoAddMusic=no when the user wants a specific track.',
     'Media is pulled by TikTok from its URL, so the media must be uploaded to Postiz and the media domain must be a verified URL property of the TikTok Business app.',
@@ -225,8 +225,7 @@ export class TiktokBusinessProvider
     if (body.indexOf('reached_active_user_cap') > -1) {
       return {
         type: 'bad-body' as const,
-        value:
-          'TikTok daily user limit reached, please try again tomorrow',
+        value: 'TikTok daily user limit reached, please try again tomorrow',
       };
     }
 
@@ -470,7 +469,9 @@ export class TiktokBusinessProvider
     try {
       body = await (
         await this.fetch(
-          `${this.baseUrl}/business/publish/status/?business_id=${encodeURIComponent(
+          `${
+            this.baseUrl
+          }/business/publish/status/?business_id=${encodeURIComponent(
             integration.internalId
           )}&publish_id=${encodeURIComponent(pendingData.publishId)}`,
           {
@@ -503,10 +504,20 @@ export class TiktokBusinessProvider
       const asString = JSON.stringify(post);
       const handleError = this.handleErrors(asString);
       if (handleError?.type === 'refresh-token') {
-        throw new RefreshToken('tiktok-business', asString, '{}', handleError.value);
+        throw new RefreshToken(
+          'tiktok-business',
+          asString,
+          '{}',
+          handleError.value
+        );
       }
       if (handleError?.type === 'disconnect') {
-        throw new Disconnect('tiktok-business', asString, '{}', handleError.value);
+        throw new Disconnect(
+          'tiktok-business',
+          asString,
+          '{}',
+          handleError.value
+        );
       }
       return { status: 'pending', pendingData };
     }
@@ -567,7 +578,10 @@ export class TiktokBusinessProvider
 
   // The Business API is PULL_FROM_URL only: TikTok downloads the media from its
   // URL, there is no FILE_UPLOAD / chunked upload variant of these endpoints.
-  private buildVideoBody(businessId: string, firstPost: PostDetails<TikTokDto>) {
+  private buildVideoBody(
+    businessId: string,
+    firstPost: PostDetails<TikTokDto>
+  ) {
     const isDraft = this.contentPostingMethod(firstPost) === 'UPLOAD';
 
     return {
@@ -845,16 +859,14 @@ export class TiktokBusinessProvider
       },
     ],
   })
-  async musicSearch(
-    accessToken: string,
-    data: { genre?: string },
-    id: string
-  ) {
+  async musicSearch(accessToken: string, data: { genre?: string }, id: string) {
     const music = await (
       await this.fetch(
-        `${this.baseUrl}/discovery/cml/trending_list/?business_id=${encodeURIComponent(
-          id
-        )}${data?.genre ? `&genre=${encodeURIComponent(data.genre)}` : ''}`,
+        `${
+          this.baseUrl
+        }/discovery/cml/trending_list/?business_id=${encodeURIComponent(id)}${
+          data?.genre ? `&genre=${encodeURIComponent(data.genre)}` : ''
+        }`,
         {
           method: 'GET',
           headers: {
@@ -871,7 +883,12 @@ export class TiktokBusinessProvider
       const asString = JSON.stringify(music);
       const handleError = this.handleErrors(asString);
       if (handleError?.type === 'refresh-token') {
-        throw new RefreshToken('tiktok-business', asString, '{}', handleError.value);
+        throw new RefreshToken(
+          'tiktok-business',
+          asString,
+          '{}',
+          handleError.value
+        );
       }
       return [];
     }
@@ -915,7 +932,9 @@ export class TiktokBusinessProvider
 
     const locations = await (
       await this.fetch(
-        `${this.baseUrl}/business/publish/location/?business_id=${encodeURIComponent(
+        `${
+          this.baseUrl
+        }/business/publish/location/?business_id=${encodeURIComponent(
           id
         )}&search_query=${encodeURIComponent(data.q.slice(0, 100))}`,
         {
@@ -932,7 +951,12 @@ export class TiktokBusinessProvider
       const asString = JSON.stringify(locations);
       const handleError = this.handleErrors(asString);
       if (handleError?.type === 'refresh-token') {
-        throw new RefreshToken('tiktok-business', asString, '{}', handleError.value);
+        throw new RefreshToken(
+          'tiktok-business',
+          asString,
+          '{}',
+          handleError.value
+        );
       }
       return [];
     }
@@ -1044,10 +1068,20 @@ export class TiktokBusinessProvider
     const asString = JSON.stringify(body);
     const handleError = this.handleErrors(asString);
     if (handleError?.type === 'refresh-token') {
-      throw new RefreshToken('tiktok-business', asString, '{}', handleError.value);
+      throw new RefreshToken(
+        'tiktok-business',
+        asString,
+        '{}',
+        handleError.value
+      );
     }
     if (handleError?.type === 'disconnect') {
-      throw new Disconnect('tiktok-business', asString, '{}', handleError.value);
+      throw new Disconnect(
+        'tiktok-business',
+        asString,
+        '{}',
+        handleError.value
+      );
     }
   }
 
@@ -1708,7 +1742,9 @@ export class TiktokBusinessProvider
 
     const body = await (
       await this.fetch(
-        `${this.baseUrl}/business/publish/status/?business_id=${encodeURIComponent(
+        `${
+          this.baseUrl
+        }/business/publish/status/?business_id=${encodeURIComponent(
           integration.internalId
         )}&publish_id=${encodeURIComponent(publishId)}`,
         {
@@ -1720,7 +1756,13 @@ export class TiktokBusinessProvider
       )
     ).text();
 
-    this.throwIfTokenError(JSON.parse(body));
+    const post = JSON.parse(body);
+    this.throwIfTokenError(post);
+
+    if (draft && post?.data?.status === 'FAILED') {
+      // an inbox item TikTok confirmed and then failed - the only trace of it
+      console.log(`TikTok inbox upload ${publishId} failed later: ${body}`);
+    }
 
     const publicPostId = this.publicPostId(body);
     if (!publicPostId) {

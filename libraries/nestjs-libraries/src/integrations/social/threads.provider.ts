@@ -33,7 +33,12 @@ import { Plug } from '@gitroom/helpers/decorators/plug.decorator';
 import { Integration } from '@prisma/client';
 import { stripHtmlValidation } from '@gitroom/helpers/utils/strip.html.validation';
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
+import { ThreadsDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/threads.dto';
+import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
 
+@Rules(
+  'If the content of the post (text, pictures or video) was made with AI, ask the user if they want to mark it as AI, and set made_with_ai to true only when they say yes.'
+)
 export class ThreadsProvider extends SocialAbstract implements SocialProvider {
   identifier = 'threads';
   name = 'Threads';
@@ -49,6 +54,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
   refreshCron = true;
 
   editor = 'normal' as const;
+  dto = ThreadsDto;
   maxLength() {
     return 500;
   }
@@ -277,7 +283,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     media: { path: string },
     message: string,
     isCarouselItem = false,
-    replyToId?: string
+    replyToId?: string,
+    madeWithAi = false
   ): Promise<string> {
     const mediaType = hasExtension(media.path, 'mp4')
       ? 'video_url'
@@ -287,6 +294,9 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
       ...(mediaType === 'image_url' ? { image_url: media.path } : {}),
       ...(isCarouselItem ? { is_carousel_item: 'true' } : {}),
       ...(replyToId ? { reply_to_id: replyToId } : {}),
+      // is_made_with_ai is rejected on carousel items, it goes on the carousel
+      // container instead
+      ...(madeWithAi && !isCarouselItem ? { is_made_with_ai: 'true' } : {}),
       media_type: mediaType === 'video_url' ? 'VIDEO' : 'IMAGE',
       text: message,
       access_token: accessToken,
@@ -309,7 +319,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     accessToken: string,
     media: { path: string }[],
     message: string,
-    replyToId?: string
+    replyToId?: string,
+    madeWithAi = false
   ): Promise<string> {
     // Create each media item
     const mediaIds = [];
@@ -335,6 +346,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
       media_type: 'CAROUSEL',
       children: mediaIds.join(','),
       ...(replyToId ? { reply_to_id: replyToId } : {}),
+      ...(madeWithAi ? { is_made_with_ai: 'true' } : {}),
       access_token: accessToken,
     });
 
@@ -355,12 +367,17 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     accessToken: string,
     message: string,
     replyToId?: string,
-    quoteId?: string
+    quoteId?: string,
+    madeWithAi = false
   ): Promise<string> {
     const form = new FormData();
     form.append('media_type', 'TEXT');
     form.append('text', message);
     form.append('access_token', accessToken);
+
+    if (madeWithAi) {
+      form.append('is_made_with_ai', 'true');
+    }
 
     if (replyToId) {
       form.append('reply_to_id', replyToId);
@@ -412,6 +429,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     replyToId?: string,
     quoteId?: string
   ): Promise<string> {
+    const madeWithAi = this.assetBoolean(postDetails.settings?.made_with_ai);
+
     // Handle content creation based on media type
     if (!postDetails.media || postDetails.media.length === 0) {
       // Text-only content
@@ -420,7 +439,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
         accessToken,
         postDetails.message,
         replyToId,
-        quoteId
+        quoteId,
+        madeWithAi
       );
     } else if (postDetails.media.length === 1) {
       // Single media content
@@ -430,7 +450,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
         postDetails.media[0],
         postDetails.message,
         false,
-        replyToId
+        replyToId,
+        madeWithAi
       );
     } else {
       // Carousel content
@@ -439,7 +460,8 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
         accessToken,
         postDetails.media,
         postDetails.message,
-        replyToId
+        replyToId,
+        madeWithAi
       );
     }
   }
@@ -469,6 +491,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     postDetails: PostDetails<{
       active_thread_finisher: boolean;
       thread_finisher: string;
+      made_with_ai?: boolean;
     }>[],
     integration: Integration
   ): Promise<PostResponse[]> {
@@ -477,6 +500,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     }
 
     const [firstPost] = postDetails;
+    const madeWithAi = this.assetBoolean(firstPost.settings?.made_with_ai);
 
     // Carousels: only create the child containers here, the carousel container
     // itself is created by finalizePost once the children are processed.
@@ -504,6 +528,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
             step: 'children',
             childIds,
             message: firstPost.message,
+            ...(madeWithAi ? { madeWithAi } : {}),
           },
         },
       ];
@@ -513,13 +538,22 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     // threads_publish runs in finalizePost.
     const containerId =
       !firstPost.media || firstPost.media.length === 0
-        ? await this.createTextContent(userId, accessToken, firstPost.message)
+        ? await this.createTextContent(
+            userId,
+            accessToken,
+            firstPost.message,
+            undefined,
+            undefined,
+            madeWithAi
+          )
         : await this.createSingleMediaContent(
             userId,
             accessToken,
             firstPost.media[0],
             firstPost.message,
-            false
+            false,
+            undefined,
+            madeWithAi
           );
 
     return [
@@ -540,6 +574,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
       childIds?: string[];
       containerId?: string;
       message?: string;
+      madeWithAi?: boolean;
     },
     integration: Integration
   ): Promise<PendingCheckResponse> {
@@ -585,6 +620,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
       childIds?: string[];
       containerId?: string;
       message?: string;
+      madeWithAi?: boolean;
     },
     integration: Integration
   ): Promise<PendingCheckResponse> {
@@ -596,6 +632,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
         text: pendingData.message || '',
         media_type: 'CAROUSEL',
         children: (pendingData.childIds || []).join(','),
+        ...(pendingData.madeWithAi ? { is_made_with_ai: 'true' } : {}),
         access_token: accessToken,
       });
 
@@ -638,6 +675,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     postDetails: PostDetails<{
       active_thread_finisher: boolean;
       thread_finisher: string;
+      made_with_ai?: boolean;
     }>[],
     integration: Integration
   ): Promise<PostResponse[]> {
@@ -711,6 +749,7 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     postDetails: PostDetails<{
       active_thread_finisher: boolean;
       thread_finisher: string;
+      made_with_ai?: boolean;
     }>[],
     integration: Integration
   ): Promise<PostResponse[]> {

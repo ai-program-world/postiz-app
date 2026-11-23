@@ -4,6 +4,7 @@ import { Post as PostBody } from '@gitroom/nestjs-libraries/dtos/posts/create.po
 import {
   APPROVED_SUBMIT_FOR_ORDER,
   CreationMethod,
+  Integration,
   Post,
   State,
 } from '@prisma/client';
@@ -15,7 +16,12 @@ import weekOfYear from 'dayjs/plugin/weekOfYear';
 import isSameOrAfter from 'dayjs/plugin/isSameOrAfter';
 import utc from 'dayjs/plugin/utc';
 import { v4 as uuidv4 } from 'uuid';
+import { capitalize } from 'lodash';
 import { CreateTagDto } from '@gitroom/nestjs-libraries/dtos/posts/create.tag.dto';
+import {
+  EncryptionService,
+  integrationEncryptedFields,
+} from '@gitroom/nestjs-libraries/services/encryption.service';
 
 dayjs.extend(isoWeek);
 dayjs.extend(weekOfYear);
@@ -30,8 +36,26 @@ export class PostsRepository {
     private _comments: PrismaRepository<'comments'>,
     private _tags: PrismaRepository<'tags'>,
     private _tagsPosts: PrismaRepository<'tagsPosts'>,
-    private _errors: PrismaRepository<'errors'>
+    private _errors: PrismaRepository<'errors'>,
+    private _encryptionService: EncryptionService
   ) {}
+
+  // A post that was loaded with its whole channel carries the tokens of the
+  // channel the way they are stored, so they are decrypted like in the
+  // integration repository
+  private async decryptIntegration<T extends { integration?: Integration | null }>(
+    post: T | null
+  ) {
+    return post?.integration
+      ? {
+          ...post,
+          integration: await this._encryptionService.decryptFields(
+            post.integration,
+            integrationEncryptedFields
+          ),
+        }
+      : post;
+  }
 
   searchForMissingThreeHoursPosts() {
     return this._post.model.post.findMany({
@@ -143,10 +167,25 @@ export class PostsRepository {
   // bad_body failures whose message came from a provider handleErrors
   // mapping or a hand-written provider throw (unmapped API responses carry
   // the 'Unknown Error' placeholder instead). Internal debug strings (e.g.
-  // 'Refresh channel needed') and unmapped failures come out as null.
-  private curatedError(error?: string | null): string | null {
+  // 'Refresh channel needed') and unmapped failures come out as null, except
+  // the two unconfirmed-post strings, which get the notification's text.
+  private curatedError(
+    error?: string | null,
+    integration?: { providerIdentifier: string; name: string }
+  ): string | null {
     if (!error) {
       return null;
+    }
+    // the post may be live, but the platform never gave a final status
+    if (
+      error === 'Could not confirm the post status' ||
+      error === 'Could not publish after several attempts'
+    ) {
+      return `Your post was sent to ${capitalize(
+        integration?.providerIdentifier
+      )}, but we couldn't confirm it was published. Please check your ${
+        integration?.name
+      } account before posting again to avoid duplicates.`;
     }
     try {
       const parsed = JSON.parse(error);
@@ -173,73 +212,86 @@ export class PostsRepository {
     const startDate = dayjs.utc(query.startDate).toDate();
     const endDate = dayjs.utc(query.endDate).toDate();
 
-    const list = await this._post.model.post.findMany({
-      where: {
-        AND: [
-          {
-            OR: [
-              {
-                organizationId: orgId,
-              },
-            ],
-          },
-          {
-            OR: [
-              {
-                publishDate: {
-                  gte: startDate,
-                  lte: endDate,
-                },
-              },
-              {
-                intervalInDays: {
-                  not: null,
-                },
-              },
-            ],
-          },
-        ],
-        integration: {
-          deletedAt: null,
-          organizationId: orgId,
-          ...(query.customer ? { customerId: query.customer } : {}),
-        },
-        deletedAt: null,
-        parentPostId: null,
-      },
-      select: {
-        id: true,
-        content: true,
-        publishDate: true,
-        releaseURL: true,
-        releaseId: true,
-        state: true,
-        error: true,
-        intervalInDays: true,
-        group: true,
-        creationMethod: true,
-        settings: true,
-        ...(includeAttachments ? { image: true } : {}),
-        tags: {
-          where: {
-            tag: {
-              deletedAt: null,
+    const whereBase = {
+      AND: [
+        {
+          OR: [
+            {
+              organizationId: orgId,
             },
-          },
-          select: {
-            tag: true,
+          ],
+        },
+      ],
+      integration: {
+        deletedAt: null as any,
+        organizationId: orgId,
+        ...(query.customer ? { customerId: query.customer } : {}),
+      },
+      deletedAt: null as Date | null,
+      parentPostId: null as string | null,
+    };
+
+    const select = {
+      id: true,
+      content: true,
+      publishDate: true,
+      releaseURL: true,
+      releaseId: true,
+      state: true,
+      error: true,
+      intervalInDays: true,
+      group: true,
+      creationMethod: true,
+      settings: true,
+      ...(includeAttachments ? { image: true } : {}),
+      tags: {
+        where: {
+          tag: {
+            deletedAt: null as Date | null,
           },
         },
-        integration: {
-          select: {
-            id: true,
-            providerIdentifier: true,
-            name: true,
-            picture: true,
-          },
+        select: {
+          tag: true,
         },
       },
-    });
+      integration: {
+        select: {
+          id: true,
+          providerIdentifier: true,
+          name: true,
+          picture: true,
+        },
+      },
+    };
+
+    // The posts of the range and the repeating posts are loaded separately: as
+    // one query ("in the range OR repeating") PostgreSQL can't use the
+    // [organizationId, publishDate] index and reads every post of the
+    // organization from disk, whatever the range is.
+    const [inRange, repeating] = await Promise.all([
+      this._post.model.post.findMany({
+        where: {
+          ...whereBase,
+          publishDate: {
+            gte: startDate,
+            lte: endDate,
+          },
+          intervalInDays: null,
+        },
+        select,
+      }),
+      this._post.model.post.findMany({
+        where: {
+          ...whereBase,
+          intervalInDays: {
+            not: null,
+          },
+        },
+        select,
+      }),
+    ]);
+
+    const list = [...inRange, ...repeating];
 
     // This runs on the request thread, so keep it linear: push into one array
     // (spreading the accumulator on every post was quadratic and blocked the
@@ -250,7 +302,14 @@ export class PostsRepository {
     const result: any[] = [];
 
     for (const row of list) {
-      const post = { ...row, error: this.curatedError(row.error) };
+      const post = {
+        ...row,
+        // the stored error stays on the row after a retry succeeds
+        error:
+          row.state === 'ERROR'
+            ? this.curatedError(row.error, row.integration)
+            : null,
+      };
       if (!post.intervalInDays || post.intervalInDays < 1) {
         result.push(post);
         continue;
@@ -411,8 +470,8 @@ export class PostsRepository {
     });
   }
 
-  getPostsByGroup(orgId: string, group: string) {
-    return this._post.model.post.findMany({
+  async getPostsByGroup(orgId: string, group: string) {
+    const posts = await this._post.model.post.findMany({
       where: {
         group,
         ...(orgId ? { organizationId: orgId } : {}),
@@ -432,6 +491,8 @@ export class PostsRepository {
         },
       },
     });
+
+    return Promise.all(posts.map((p) => this.decryptIntegration(p)));
   }
 
   // the posts of the other channels in the batch, without the given group
@@ -454,13 +515,13 @@ export class PostsRepository {
     });
   }
 
-  getPost(
+  async getPost(
     id: string,
     includeIntegration = false,
     orgId?: string,
     isFirst?: boolean
   ) {
-    return this._post.model.post.findUnique({
+    const post = await this._post.model.post.findUnique({
       where: {
         id,
         ...(orgId ? { organizationId: orgId } : {}),
@@ -485,6 +546,8 @@ export class PostsRepository {
         childrenPost: true,
       },
     });
+
+    return this.decryptIntegration(post);
   }
 
   updatePost(id: string, postId: string, releaseURL: string) {
@@ -628,6 +691,19 @@ export class PostsRepository {
             state: 'PUBLISHED',
           },
         ],
+      },
+    });
+  }
+
+  countPostsOfOtherOrganizations(orgId: string, ids: string[]) {
+    return this._post.model.post.count({
+      where: {
+        organizationId: {
+          not: orgId,
+        },
+        id: {
+          in: ids,
+        },
       },
     });
   }
@@ -785,6 +861,7 @@ export class PostsRepository {
       ? (
           await this._post.model.post.findFirst({
             where: {
+              organizationId: orgId,
               group: body.group,
               deletedAt: null,
               parentPostId: null,
@@ -799,6 +876,7 @@ export class PostsRepository {
     if (body.group && !keepGroup) {
       await this._post.model.post.updateMany({
         where: {
+          organizationId: orgId,
           group: body.group,
           deletedAt: null,
         },
@@ -814,6 +892,7 @@ export class PostsRepository {
     if (body.group && keepGroup) {
       await this._post.model.post.updateMany({
         where: {
+          organizationId: orgId,
           group: body.group,
           deletedAt: null,
           id: {
@@ -863,8 +942,8 @@ export class PostsRepository {
     });
   }
 
-  getPostById(id: string, org?: string) {
-    return this._post.model.post.findUnique({
+  async getPostById(id: string, org?: string) {
+    const post = await this._post.model.post.findUnique({
       where: {
         id,
         ...(org ? { organizationId: org } : {}),
@@ -889,6 +968,8 @@ export class PostsRepository {
         },
       },
     });
+
+    return this.decryptIntegration(post);
   }
 
   private get postTimelineSelect() {
