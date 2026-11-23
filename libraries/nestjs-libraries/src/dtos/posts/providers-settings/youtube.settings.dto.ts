@@ -1,5 +1,6 @@
 import {
   IsArray,
+  IsBoolean,
   IsDefined,
   IsIn,
   IsOptional,
@@ -65,8 +66,10 @@ export class YoutubeTagsSettings {
 }
 
 export class YoutubeSettingsDto {
+  // YouTube's own limits only (title 1-100 characters), the Required Minimum
+  // Functionality does not allow more
   @IsString()
-  @MinLength(2)
+  @MinLength(1)
   @MaxLength(100)
   @IsDefined()
   title: string;
@@ -108,4 +111,12 @@ export class YoutubeSettingsDto {
       'The id of a playlist of the channel (from the playlists list of the channel), not the playlist name. The video is added to it after the upload',
   })
   playlistId?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  @JSONSchema({
+    description:
+      'Discloses that the video has realistic altered or AI generated content (YouTube shows its altered or synthetic content label). YouTube asks for it only when the content looks realistic, not for animation or clearly unrealistic content.',
+  })
+  made_with_ai?: boolean;
 }
