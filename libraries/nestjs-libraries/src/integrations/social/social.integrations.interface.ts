@@ -28,6 +28,14 @@ export interface IAuthenticator {
     accessToken: string,
     date: number
   ): Promise<AnalyticsData[]>;
+  // Next pages of the posts leaderboard, after `AnalyticsData.postsNextCursor`
+  analyticsPosts?(
+    id: string,
+    accessToken: string,
+    date: number,
+    limit: number,
+    cursor?: string
+  ): Promise<AnalyticsPostsPage>;
   postAnalytics?(
     integrationId: string,
     accessToken: string,
@@ -80,6 +88,11 @@ export interface AnalyticsBreakdownItem {
   percentage?: number;
 }
 
+export interface AnalyticsPostsPage {
+  posts: AnalyticsPostItem[];
+  nextCursor?: string;
+}
+
 export interface AnalyticsPostItem {
   id: string;
   title: string;
@@ -116,6 +129,8 @@ export interface AnalyticsData {
     | 'posts';
   breakdown?: AnalyticsBreakdownItem[];
   posts?: AnalyticsPostItem[];
+  // Set when more posts can be loaded with analyticsPosts
+  postsNextCursor?: string;
   note?: string;
   updatedAt?: string;
   // `data` is an ordered curve (e.g. audience retention), not a daily series:

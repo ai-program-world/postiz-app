@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   AnalyticsPostItem,
+  AnalyticsPostsPage,
   AnalyticsSnapshotData,
   AuthTokenDetails,
   PendingCheckResponse,
@@ -46,8 +47,8 @@ export const META_GRAPH_API_VERSION = 'v25.0';
 // Editing the AI self-disclosure of a Page post only exists from v27.0
 const META_AI_DISCLOSURE_API_VERSION = 'v27.0';
 const AI_DISCLOSURE_TIMEOUT = 30_000;
-// Posts listed in the analytics leaderboard for one date range
-const FB_RANGE_POSTS_LIMIT = 50;
+// Posts in the first page of the analytics leaderboard, the rest load on demand
+const FB_POSTS_PAGE_SIZE = 10;
 
 @Rules(
   [
@@ -1212,15 +1213,7 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     const prevWindows = date <= 30 ? previousDateWindows(date, 28) : [];
     const result: AnalyticsData[] = [];
 
-    const sumValue = (value: any): number => {
-      if (value && typeof value === 'object') {
-        return Object.values(value as Record<string, number>).reduce(
-          (sum: number, v: number) => sum + (Number(v) || 0),
-          0
-        );
-      }
-      return Number(value) || 0;
-    };
+    const sumValue = this.sumInsightValue;
 
     // 1. Page overview snapshot (followers_count, fan_count)
     const pageInfo = await safeAnalyticsCall(
@@ -1634,179 +1627,207 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       });
     }
 
-    // 4. Recent Published Posts Leaderboard
-    const recentPosts = await safeAnalyticsCall<AnalyticsPostItem[]>(
+    // 4. Recent Published Posts Leaderboard, the next pages are loaded on demand
+    const recentPosts = await safeAnalyticsCall(
       'fb.recent_posts',
-      async () => {
-        // Every post published in the selected range, following Graph paging.
-        // Each post costs a few insights calls, so the list is capped.
-        const postFields =
-          'id,message,permalink_url,full_picture,created_time,shares,attachments{media_type,target}';
-        const posts: any[] = [];
-        const since = windows[0].since;
-        const until = windows[windows.length - 1].until;
-        let nextUrl: string | undefined =
-          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?fields=${postFields}` +
-          `&since=${since}&until=${until}&limit=25&access_token=${accessToken}`;
-        while (nextUrl && posts.length < FB_RANGE_POSTS_LIMIT) {
-          const url: string = nextUrl;
-          // a failing later page keeps the posts already fetched
-          const feedRes = posts.length
-            ? await safeAnalyticsCall(
-                'fb.recent_posts.page',
-                () => this.fetchFbJson(url),
-                null
-              )
-            : await this.fetchFbJson(url);
-          posts.push(...(feedRes?.data || []));
-          nextUrl = feedRes?.paging?.next;
-        }
-        // A quiet range still shows the latest posts, like before
-        if (posts.length === 0) {
-          const latestRes = await this.fetchFbJson(
-            `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?fields=${postFields}&limit=10&access_token=${accessToken}`
-          );
-          posts.push(...(latestRes?.data || []));
-        }
-
-        const items: AnalyticsPostItem[] = [];
-        // a few posts at a time, so a long range doesn't burst hundreds of calls
-        for (const batch of chunk(posts.slice(0, FB_RANGE_POSTS_LIMIT), 10)) {
-          items.push(
-            ...(await Promise.all(
-              batch.map(async (p) => {
-                // Reels / videos keep watch time on the video node, not the post
-                const videoId = (p?.attachments?.data || []).find((a: any) =>
-                  String(a?.media_type || '').startsWith('video')
-                )?.target?.id;
-                // Views/reach are requested on their own so an invalid engagement
-                // metric can't fail the whole call and blank the view counts.
-                const [viewsRes, insRes, countsRes, watchRes, retention] =
-                  await Promise.all([
-                    safeAnalyticsCall(
-                      `fb.post.views.${p.id}`,
-                      () =>
-                        this.fetchFbJson(
-                          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_media_view,post_total_media_view_unique&access_token=${accessToken}`
-                        ),
-                      null
-                    ),
-                    safeAnalyticsCall(
-                      `fb.post.ins.${p.id}`,
-                      () =>
-                        this.fetchFbJson(
-                          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_clicks,post_reactions_by_type_total&access_token=${accessToken}`
-                        ),
-                      null
-                    ),
-                    safeAnalyticsCall(
-                      `fb.post.counts.${p.id}`,
-                      () =>
-                        this.fetchFbJson(
-                          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}?fields=comments.summary(true).limit(0)&access_token=${accessToken}`
-                        ),
-                      null
-                    ),
-                    videoId
-                      ? safeAnalyticsCall(
-                          `fb.post.watch_time.${p.id}`,
-                          () =>
-                            this.fetchFbJson(
-                              `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=post_video_avg_time_watched&access_token=${accessToken}`
-                            ),
-                          null
-                        )
-                      : Promise.resolve(null),
-                    videoId
-                      ? this.fetchVideoRetention(accessToken, videoId)
-                      : Promise.resolve(null),
-                  ]);
-                const avgWatchMs = watchRes?.data?.[0]?.values?.[0]?.value;
-                const curve = retention
-                  ? this.parseRetentionCurve(
-                      retention.value,
-                      retention.lengthSec
-                    )
-                  : null;
-
-                let views: number | undefined;
-                let reach: number | undefined;
-                let clicks = 0;
-                let likes: number | undefined;
-                for (const m of viewsRes?.data || []) {
-                  const v = m?.values?.[0]?.value;
-                  if (v === undefined) continue;
-                  if (m.name === 'post_media_view') {
-                    views = sumValue(v);
-                  } else if (m.name === 'post_total_media_view_unique') {
-                    reach = sumValue(v);
-                  }
-                }
-                for (const m of insRes?.data || []) {
-                  const v = m?.values?.[0]?.value;
-                  if (v === undefined) continue;
-                  if (m.name === 'post_clicks') {
-                    clicks = Number(v) || 0;
-                  } else if (m.name === 'post_reactions_by_type_total') {
-                    likes = sumValue(v);
-                  }
-                }
-                const comments =
-                  countsRes?.comments?.summary?.total_count !== undefined
-                    ? Number(countsRes.comments.summary.total_count) || 0
-                    : undefined;
-                // Graph omits `shares` entirely when a post has no shares
-                const shares = Number(p?.shares?.count) || 0;
-                const interactions =
-                  (likes || 0) + (comments || 0) + (shares || 0) + clicks;
-                const engagementBase = reach || views || 0;
-
-                return {
-                  id: String(p.id),
-                  title: summarizePostTitle(p.message, 'Facebook Post'),
-                  url: p.permalink_url,
-                  thumbnail: p.full_picture,
-                  publishedAt: p.created_time
-                    ? dayjs(p.created_time).format('YYYY-MM-DD HH:mm')
-                    : today,
-                  reach,
-                  views: views ?? reach,
-                  likes,
-                  comments,
-                  shares,
-                  engagementRate:
-                    engagementBase > 0
-                      ? Number(
-                          ((interactions / engagementBase) * 100).toFixed(2)
-                        )
-                      : undefined,
-                  avgWatchTimeSeconds:
-                    typeof avgWatchMs === 'number'
-                      ? Number((avgWatchMs / 1000).toFixed(1))
-                      : undefined,
-                  retention3sRate: curve?.retention3sRate,
-                  completionRate: curve?.completionRate,
-                } as AnalyticsPostItem;
-              })
-            ))
-          );
-        }
-        return items;
-      },
-      []
+      () => this.analyticsPosts(id, accessToken, date, FB_POSTS_PAGE_SIZE),
+      { posts: [] as AnalyticsPostItem[] }
     );
 
-    if (recentPosts.length > 0) {
+    if (recentPosts.posts.length > 0) {
       result.push({
         label: 'Recent Posts Performance',
         percentageChange: 0,
         category: 'posts',
-        posts: recentPosts,
-        data: [{ total: String(recentPosts.length), date: today }],
+        posts: recentPosts.posts,
+        postsNextCursor: recentPosts.nextCursor,
+        data: [{ total: String(recentPosts.posts.length), date: today }],
       });
     }
 
     return result;
+  }
+
+  // One page of the posts published in the selected range
+  async analyticsPosts(
+    id: string,
+    accessToken: string,
+    date: number,
+    limit: number,
+    cursor?: string
+  ): Promise<AnalyticsPostsPage> {
+    const today = dayjs().format('YYYY-MM-DD');
+    const sumValue = this.sumInsightValue;
+    const windows = splitDateWindows(date, 28);
+    const since = windows[0].since;
+    const until = windows[windows.length - 1].until;
+    const postFields =
+      'id,message,permalink_url,full_picture,created_time,shares,attachments{media_type,target}';
+
+    // The cursor is the query of Graph's `paging.next` without the token, so
+    // both cursor based and time based (`until` + `__paging_token`) paging work
+    const query = new URLSearchParams(
+      cursor || `fields=${postFields}&since=${since}&until=${until}`
+    );
+    query.set('limit', String(limit));
+    query.delete('access_token');
+    const feedRes = await this.fetchFbJson(
+      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?${query.toString()}&access_token=${accessToken}`
+    );
+    let posts: any[] = feedRes?.data || [];
+    let nextCursor = this.analyticsPostsCursor(feedRes?.paging?.next);
+
+    // A quiet range still shows the latest posts, like before
+    if (!cursor && posts.length === 0) {
+      const latestRes = await this.fetchFbJson(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?fields=${postFields}&limit=${limit}&access_token=${accessToken}`
+      );
+      posts = latestRes?.data || [];
+      nextCursor = undefined;
+    }
+
+    const items: AnalyticsPostItem[] = [];
+    // a few posts at a time, so a big page doesn't burst hundreds of calls
+    for (const batch of chunk(posts, 10)) {
+      items.push(
+        ...(await Promise.all(
+          batch.map(async (p) => {
+            // Reels / videos keep watch time on the video node, not the post
+            const videoId = (p?.attachments?.data || []).find((a: any) =>
+              String(a?.media_type || '').startsWith('video')
+            )?.target?.id;
+            // Views/reach are requested on their own so an invalid engagement
+            // metric can't fail the whole call and blank the view counts.
+            const [viewsRes, insRes, countsRes, watchRes, retention] =
+              await Promise.all([
+                safeAnalyticsCall(
+                  `fb.post.views.${p.id}`,
+                  () =>
+                    this.fetchFbJson(
+                      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_media_view,post_total_media_view_unique&access_token=${accessToken}`
+                    ),
+                  null
+                ),
+                safeAnalyticsCall(
+                  `fb.post.ins.${p.id}`,
+                  () =>
+                    this.fetchFbJson(
+                      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}/insights?metric=post_clicks,post_reactions_by_type_total&access_token=${accessToken}`
+                    ),
+                  null
+                ),
+                safeAnalyticsCall(
+                  `fb.post.counts.${p.id}`,
+                  () =>
+                    this.fetchFbJson(
+                      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${p.id}?fields=comments.summary(true).limit(0)&access_token=${accessToken}`
+                    ),
+                  null
+                ),
+                videoId
+                  ? safeAnalyticsCall(
+                      `fb.post.watch_time.${p.id}`,
+                      () =>
+                        this.fetchFbJson(
+                          `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=post_video_avg_time_watched&access_token=${accessToken}`
+                        ),
+                      null
+                    )
+                  : Promise.resolve(null),
+                videoId
+                  ? this.fetchVideoRetention(accessToken, videoId)
+                  : Promise.resolve(null),
+              ]);
+            const avgWatchMs = watchRes?.data?.[0]?.values?.[0]?.value;
+            const curve = retention
+              ? this.parseRetentionCurve(retention.value, retention.lengthSec)
+              : null;
+
+            let views: number | undefined;
+            let reach: number | undefined;
+            let clicks = 0;
+            let likes: number | undefined;
+            for (const m of viewsRes?.data || []) {
+              const v = m?.values?.[0]?.value;
+              if (v === undefined) continue;
+              if (m.name === 'post_media_view') {
+                views = sumValue(v);
+              } else if (m.name === 'post_total_media_view_unique') {
+                reach = sumValue(v);
+              }
+            }
+            for (const m of insRes?.data || []) {
+              const v = m?.values?.[0]?.value;
+              if (v === undefined) continue;
+              if (m.name === 'post_clicks') {
+                clicks = Number(v) || 0;
+              } else if (m.name === 'post_reactions_by_type_total') {
+                likes = sumValue(v);
+              }
+            }
+            const comments =
+              countsRes?.comments?.summary?.total_count !== undefined
+                ? Number(countsRes.comments.summary.total_count) || 0
+                : undefined;
+            // Graph omits `shares` entirely when a post has no shares
+            const shares = Number(p?.shares?.count) || 0;
+            const interactions =
+              (likes || 0) + (comments || 0) + (shares || 0) + clicks;
+            const engagementBase = reach || views || 0;
+
+            return {
+              id: String(p.id),
+              title: summarizePostTitle(p.message, 'Facebook Post'),
+              url: p.permalink_url,
+              thumbnail: p.full_picture,
+              publishedAt: p.created_time
+                ? dayjs(p.created_time).format('YYYY-MM-DD HH:mm')
+                : today,
+              reach,
+              views: views ?? reach,
+              likes,
+              comments,
+              shares,
+              engagementRate:
+                engagementBase > 0
+                  ? Number(((interactions / engagementBase) * 100).toFixed(2))
+                  : undefined,
+              avgWatchTimeSeconds:
+                typeof avgWatchMs === 'number'
+                  ? Number((avgWatchMs / 1000).toFixed(1))
+                  : undefined,
+              retention3sRate: curve?.retention3sRate,
+              completionRate: curve?.completionRate,
+            } as AnalyticsPostItem;
+          })
+        ))
+      );
+    }
+
+    return { posts: items, nextCursor };
+  }
+
+  private analyticsPostsCursor(next?: string): string | undefined {
+    if (!next) {
+      return undefined;
+    }
+    try {
+      const query = new URL(next).searchParams;
+      query.delete('access_token');
+      return query.toString();
+    } catch (err) {
+      return undefined;
+    }
+  }
+
+  private sumInsightValue(value: any): number {
+    if (value && typeof value === 'object') {
+      return Object.values(value as Record<string, number>).reduce(
+        (sum: number, v: number) => sum + (Number(v) || 0),
+        0
+      );
+    }
+    return Number(value) || 0;
   }
 
   async analyticsSnapshot(

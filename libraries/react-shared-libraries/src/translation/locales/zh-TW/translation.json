@@ -906,6 +906,8 @@
   "leaderboard_post": "貼文／影片",
   "leaderboard_date": "發布日期",
   "posts_count_suffix": "則內容",
+  "load_more_posts": "載入更多內容",
+  "retry_load_more_posts": "載入失敗，請再試一次",
   "peak": "尖峰",
   "metric_followers": "追蹤者人數",
   "metric_following": "追蹤中",

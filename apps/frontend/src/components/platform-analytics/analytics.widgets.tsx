@@ -3,8 +3,11 @@
 import React, { FC, useMemo, useState } from 'react';
 import clsx from 'clsx';
 import dayjs from 'dayjs';
+import useSWRInfinite from 'swr/infinite';
 import { ChartSocial } from '@gitroom/frontend/components/analytics/chart-social';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
+import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
+import { Button } from '@gitroom/react/form/button';
 
 export interface AnalyticsBreakdownEntry {
   label: string;
@@ -47,6 +50,8 @@ export interface RichAnalyticsItem {
     | 'posts';
   breakdown?: AnalyticsBreakdownEntry[];
   posts?: AnalyticsPostEntry[];
+  // more posts can be loaded from /analytics/:integration/posts
+  postsNextCursor?: string;
   note?: string;
   updatedAt?: string;
   curve?: boolean;
@@ -511,11 +516,67 @@ type SortKey =
   | 'completionRate'
   | 'publishedAt';
 
+const ANALYTICS_POSTS_PAGE_SIZE = 25;
+
+// The posts after the first page, one SWR page per "load more" click
+const useAnalyticsMorePosts = (
+  integrationId: string,
+  date: number,
+  firstCursor?: string
+) => {
+  const fetch = useFetch();
+  return useSWRInfinite<{ posts: AnalyticsPostEntry[]; nextCursor?: string }>(
+    (index, previous) => {
+      const cursor = index === 0 ? firstCursor : previous?.nextCursor;
+      return cursor
+        ? `/analytics/${integrationId}/posts?date=${date}&limit=${ANALYTICS_POSTS_PAGE_SIZE}&cursor=${encodeURIComponent(
+            cursor
+          )}`
+        : null;
+    },
+    async (url: string) => {
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error('Could not load more posts');
+      }
+      return res.json();
+    },
+    {
+      initialSize: 0,
+      revalidateFirstPage: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+    }
+  );
+};
+
 export const AnalyticsPostsLeaderboard: FC<{
   item: RichAnalyticsItem;
-}> = ({ item }) => {
+  integrationId: string;
+  date: number;
+}> = ({ item, integrationId, date }) => {
   const t = useT();
-  const posts = item.posts || [];
+  const {
+    data: morePages,
+    size,
+    setSize,
+    isValidating,
+    error,
+    mutate,
+  } = useAnalyticsMorePosts(integrationId, date, item.postsNextCursor);
+  const posts = useMemo(
+    () => [
+      ...(item.posts || []),
+      ...(morePages || []).flatMap((page) => page?.posts || []),
+    ],
+    [item.posts, morePages]
+  );
+  const hasMore =
+    size === 0
+      ? !!item.postsNextCursor
+      : !!morePages?.[size - 1]?.nextCursor;
+  const loadingMore = isValidating && size > (morePages?.length || 0);
   const [sortByKey, setSortByKey] = useState<SortKey>('views');
   const [sortDesc, setSortDesc] = useState(true);
 
@@ -730,6 +791,19 @@ export const AnalyticsPostsLeaderboard: FC<{
           </tbody>
         </table>
       </div>
+      {(hasMore || loadingMore || !!error) && (
+        <div className="flex justify-center px-[16px] py-[12px] border-t border-newTableBorder">
+          <Button
+            secondary={true}
+            loading={loadingMore}
+            onClick={() => (error ? mutate() : setSize(size + 1))}
+          >
+            {error
+              ? t('retry_load_more_posts', 'Could not load posts, try again')
+              : t('load_more_posts', 'Load more posts')}
+          </Button>
+        </div>
+      )}
     </div>
   );
 };

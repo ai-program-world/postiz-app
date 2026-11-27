@@ -273,8 +273,8 @@ describe('FacebookProvider video cover', () => {
 });
 
 describe('FacebookProvider analytics posts list', () => {
-  const recentPosts = (result: any[]) =>
-    result.find((r) => r.label === 'Recent Posts Performance')?.posts || [];
+  const postsCard = (result: any[]) =>
+    result.find((r) => r.label === 'Recent Posts Performance');
 
   const mockGraph = (
     provider: FacebookProvider,
@@ -288,58 +288,79 @@ describe('FacebookProvider analytics posts list', () => {
     return fetchFbJson;
   };
 
+  const feedUrls = (fetchFbJson: jest.Mock) =>
+    fetchFbJson.mock.calls
+      .map(([url]) => url as string)
+      .filter((url) => url.includes('/published_posts'));
+
   const post = (n: number) => ({
     id: `page-1_${n}`,
     message: `post ${n}`,
     created_time: '2026-11-20T10:00:00+0000',
   });
 
-  it('lists every post of the range by following paging', async () => {
-    const provider = new FacebookProvider();
-    const fetchFbJson = mockGraph(provider, (url) =>
-      url.includes('after=page2')
-        ? { data: [11, 12, 13].map(post) }
-        : {
-            data: Array.from({ length: 10 }, (_, i) => post(i + 1)),
-            paging: {
-              next: 'https://graph.facebook.com/v25.0/page-1/published_posts?after=page2',
-            },
-          }
-    );
-
-    const posts = recentPosts(await provider.analytics('page-1', 'token', 30));
-
-    expect(posts).toHaveLength(13);
-    const firstFeedUrl = fetchFbJson.mock.calls
-      .map(([url]) => url)
-      .find((url) => url.includes('/published_posts'));
-    expect(firstFeedUrl).toContain('&since=');
-    expect(firstFeedUrl).toContain('&until=');
+  const pagedFeed = () => ({
+    data: Array.from({ length: 10 }, (_, i) => post(i + 1)),
+    paging: {
+      cursors: { after: 'cursor-2' },
+      next: 'https://graph.facebook.com/v25.0/page-1/published_posts?fields=id&limit=10&access_token=token&after=cursor-2',
+    },
   });
 
-  it('stops at the posts cap', async () => {
+  it('returns the first page of the range with the next cursor only', async () => {
     const provider = new FacebookProvider();
-    let page = 0;
-    mockGraph(provider, () => ({
-      data: Array.from({ length: 25 }, (_, i) => post(page++ * 25 + i)),
-      paging: {
-        next: 'https://graph.facebook.com/v25.0/page-1/published_posts?after=x',
-      },
+    const fetchFbJson = mockGraph(provider, pagedFeed);
+
+    const card = postsCard(await provider.analytics('page-1', 'token', 30));
+
+    expect(card.posts).toHaveLength(10);
+    // the cursor never carries the page token
+    expect(card.postsNextCursor).toBe('fields=id&limit=10&after=cursor-2');
+    const [firstUrl] = feedUrls(fetchFbJson);
+    expect(firstUrl).toContain('&since=');
+    expect(firstUrl).toContain('&until=');
+    expect(firstUrl).toContain('&limit=10');
+  });
+
+  it('loads the next page from the cursor', async () => {
+    const provider = new FacebookProvider();
+    const fetchFbJson = mockGraph(provider, () => ({
+      data: [11, 12, 13].map(post),
+      paging: {},
     }));
 
-    const posts = recentPosts(await provider.analytics('page-1', 'token', 90));
+    const page = await provider.analyticsPosts(
+      'page-1',
+      'token',
+      30,
+      25,
+      'fields=id&limit=10&until=1700000000&__paging_token=abc&access_token=evil'
+    );
 
-    expect(posts).toHaveLength(50);
+    expect(page.posts.map((p) => p.id)).toEqual([
+      'page-1_11',
+      'page-1_12',
+      'page-1_13',
+    ]);
+    expect(page.nextCursor).toBeUndefined();
+    const [url] = feedUrls(fetchFbJson);
+    expect(url).toContain('until=1700000000');
+    expect(url).toContain('__paging_token=abc');
+    expect(url).toContain('limit=25');
+    expect(url).not.toContain('evil');
   });
 
   it('falls back to the latest posts when the range has none', async () => {
     const provider = new FacebookProvider();
     mockGraph(provider, (url) =>
-      url.includes('&since=') ? { data: [] } : { data: [post(1), post(2)] }
+      url.includes('&since=')
+        ? { data: [] }
+        : { data: [post(1), post(2)], paging: pagedFeed().paging }
     );
 
-    const posts = recentPosts(await provider.analytics('page-1', 'token', 7));
+    const card = postsCard(await provider.analytics('page-1', 'token', 7));
 
-    expect(posts).toHaveLength(2);
+    expect(card.posts).toHaveLength(2);
+    expect(card.postsNextCursor).toBeUndefined();
   });
 });

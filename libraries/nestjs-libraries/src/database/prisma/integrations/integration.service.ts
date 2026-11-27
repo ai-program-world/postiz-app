@@ -9,6 +9,7 @@ import { IntegrationRepository } from '@gitroom/nestjs-libraries/database/prisma
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
 import {
   AnalyticsData,
+  AnalyticsPostsPage,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { Integration, Organization } from '@prisma/client';
@@ -708,6 +709,96 @@ export class IntegrationService {
     }
 
     return [];
+  }
+
+  // The next pages of the analytics posts leaderboard
+  async checkAnalyticsPosts(
+    org: Organization,
+    integration: string,
+    date: number,
+    limit: number,
+    cursor: string,
+    forceRefresh = false
+  ): Promise<AnalyticsPostsPage> {
+    const days = Number(date) > 0 ? Number(date) : 7;
+    const getIntegration = await this.getIntegrationById(org.id, integration);
+
+    if (!getIntegration || getIntegration.type !== 'social') {
+      return { posts: [] };
+    }
+
+    const integrationProvider = this._integrationManager.getSocialIntegration(
+      getIntegration.providerIdentifier
+    );
+
+    // A deleted channel is neither refreshed nor called
+    if (getIntegration.deletedAt || !integrationProvider.analyticsPosts) {
+      return { posts: [] };
+    }
+
+    if (
+      (dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) &&
+        !integrationProvider.noRefreshBeforeCall) ||
+      forceRefresh
+    ) {
+      const data = await this._refreshIntegrationService.refresh(
+        getIntegration
+      );
+      if (!data) {
+        return { posts: [] };
+      }
+
+      const { accessToken } = data;
+
+      if (accessToken) {
+        getIntegration.token = accessToken;
+
+        if (integrationProvider.refreshWait) {
+          await timer(10000);
+        }
+      } else {
+        await this.disconnectChannel(org.id, getIntegration);
+        return { posts: [] };
+      }
+    }
+
+    const cacheKey = `integration:${org.id}:${integration}:${days}:posts:${limit}:${cursor}`;
+    const getIntegrationData = await ioRedis.get(cacheKey);
+    if (getIntegrationData) {
+      return JSON.parse(getIntegrationData);
+    }
+
+    try {
+      const page = await integrationProvider.analyticsPosts(
+        getIntegration.internalId,
+        getIntegration.token,
+        days,
+        limit,
+        cursor
+      );
+      await ioRedis.set(
+        cacheKey,
+        JSON.stringify(page),
+        'EX',
+        !process.env.NODE_ENV || process.env.NODE_ENV === 'development'
+          ? 1
+          : 3600
+      );
+      return page;
+    } catch (e) {
+      if (e instanceof RefreshToken && !forceRefresh) {
+        return this.checkAnalyticsPosts(
+          org,
+          integration,
+          date,
+          limit,
+          cursor,
+          true
+        );
+      }
+    }
+
+    return { posts: [] };
   }
 
   customers(orgId: string) {
