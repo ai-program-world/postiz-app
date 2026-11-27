@@ -271,3 +271,75 @@ describe('FacebookProvider video cover', () => {
     expect(fetchMock.mock.calls[0][0]).toContain('/page-1/photos');
   });
 });
+
+describe('FacebookProvider analytics posts list', () => {
+  const recentPosts = (result: any[]) =>
+    result.find((r) => r.label === 'Recent Posts Performance')?.posts || [];
+
+  const mockGraph = (
+    provider: FacebookProvider,
+    feed: (url: string) => any
+  ) => {
+    const fetchFbJson = jest.fn(async (url: string) =>
+      url.includes('/published_posts') ? feed(url) : { data: [] }
+    );
+    (provider as any).fetchFbJson = fetchFbJson;
+    (provider as any).fetchVideoRetention = jest.fn().mockResolvedValue(null);
+    return fetchFbJson;
+  };
+
+  const post = (n: number) => ({
+    id: `page-1_${n}`,
+    message: `post ${n}`,
+    created_time: '2026-11-20T10:00:00+0000',
+  });
+
+  it('lists every post of the range by following paging', async () => {
+    const provider = new FacebookProvider();
+    const fetchFbJson = mockGraph(provider, (url) =>
+      url.includes('after=page2')
+        ? { data: [11, 12, 13].map(post) }
+        : {
+            data: Array.from({ length: 10 }, (_, i) => post(i + 1)),
+            paging: {
+              next: 'https://graph.facebook.com/v25.0/page-1/published_posts?after=page2',
+            },
+          }
+    );
+
+    const posts = recentPosts(await provider.analytics('page-1', 'token', 30));
+
+    expect(posts).toHaveLength(13);
+    const firstFeedUrl = fetchFbJson.mock.calls
+      .map(([url]) => url)
+      .find((url) => url.includes('/published_posts'));
+    expect(firstFeedUrl).toContain('&since=');
+    expect(firstFeedUrl).toContain('&until=');
+  });
+
+  it('stops at the posts cap', async () => {
+    const provider = new FacebookProvider();
+    let page = 0;
+    mockGraph(provider, () => ({
+      data: Array.from({ length: 25 }, (_, i) => post(page++ * 25 + i)),
+      paging: {
+        next: 'https://graph.facebook.com/v25.0/page-1/published_posts?after=x',
+      },
+    }));
+
+    const posts = recentPosts(await provider.analytics('page-1', 'token', 90));
+
+    expect(posts).toHaveLength(50);
+  });
+
+  it('falls back to the latest posts when the range has none', async () => {
+    const provider = new FacebookProvider();
+    mockGraph(provider, (url) =>
+      url.includes('&since=') ? { data: [] } : { data: [post(1), post(2)] }
+    );
+
+    const posts = recentPosts(await provider.analytics('page-1', 'token', 7));
+
+    expect(posts).toHaveLength(2);
+  });
+});
