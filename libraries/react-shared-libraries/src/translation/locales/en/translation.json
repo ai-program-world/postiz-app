@@ -922,6 +922,8 @@
   "leaderboard_post": "Post",
   "leaderboard_date": "Date",
   "posts_count_suffix": "posts",
+  "load_more_posts": "Load more posts",
+  "retry_load_more_posts": "Could not load posts, try again",
   "peak": "Peak",
   "metric_followers": "Followers",
   "metric_following": "Following",

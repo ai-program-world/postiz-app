@@ -233,6 +233,8 @@ export const RenderAnalytics: FC<{
         <AnalyticsPostsLeaderboard
           key={`posts-${item.label}-${index}`}
           item={item}
+          integrationId={integration.id}
+          date={date}
         />
       ))}
     </div>

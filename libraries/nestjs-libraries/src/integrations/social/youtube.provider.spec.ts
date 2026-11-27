@@ -5,6 +5,8 @@ import { plainToInstance } from 'class-transformer';
 const videoCategoriesList = jest.fn();
 const playlistsList = jest.fn();
 const playlistItemsInsert = jest.fn();
+const videosList = jest.fn();
+const reportsQuery = jest.fn();
 
 jest.mock('googleapis', () => ({
   google: {
@@ -17,8 +19,9 @@ jest.mock('googleapis', () => ({
       videoCategories: { list: videoCategoriesList },
       playlists: { list: playlistsList },
       playlistItems: { insert: playlistItemsInsert },
+      videos: { list: videosList },
     })),
-    youtubeAnalytics: jest.fn(() => ({})),
+    youtubeAnalytics: jest.fn(() => ({ reports: { query: reportsQuery } })),
     oauth2: jest.fn(() => ({})),
   },
 }));
@@ -339,5 +342,54 @@ describe('YoutubeProvider category and playlist', () => {
       expect(playlistItemsInsert).not.toHaveBeenCalled();
       expect(result.status).toBe('completed');
     });
+  });
+});
+
+describe('YoutubeProvider analytics posts paging', () => {
+  const report = (ids: string[]) => ({
+    data: {
+      columnHeaders: [{ name: 'video' }, { name: 'views' }],
+      rows: ids.map((id, i) => [id, 100 - i]),
+    },
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    videosList.mockResolvedValue({ data: { items: [] } });
+  });
+
+  it('returns the next startIndex while pages are full', async () => {
+    reportsQuery.mockResolvedValue(report(['a', 'b']));
+
+    const page = await new YoutubeProvider().analyticsPosts(
+      'channel',
+      'token',
+      30,
+      2
+    );
+
+    expect(page.posts.map((p) => p.id)).toEqual(['a', 'b']);
+    expect(page.nextCursor).toBe('3');
+    expect(reportsQuery).toHaveBeenCalledWith(
+      expect.objectContaining({ maxResults: 2, startIndex: 1 })
+    );
+  });
+
+  it('stops on a short page', async () => {
+    reportsQuery.mockResolvedValue(report(['c']));
+
+    const page = await new YoutubeProvider().analyticsPosts(
+      'channel',
+      'token',
+      30,
+      2,
+      '3'
+    );
+
+    expect(page.posts.map((p) => p.id)).toEqual(['c']);
+    expect(page.nextCursor).toBeUndefined();
+    expect(reportsQuery).toHaveBeenCalledWith(
+      expect.objectContaining({ startIndex: 3 })
+    );
   });
 });

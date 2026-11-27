@@ -227,3 +227,37 @@ export function summarizePostTitle(
   if (chars.length <= maxLen) return cleaned;
   return chars.slice(0, maxLen).join('') + '…';
 }
+
+/**
+ * Meta Graph (Facebook / Instagram / Threads) paging for post leaderboards.
+ * The cursor handed to the client is the query of `paging.next` without the
+ * access token, so cursor based (`after`) and time based (`until` +
+ * `__paging_token`) paging both work and the token never leaves the server.
+ */
+export function graphPagingCursor(next?: string): string | undefined {
+  if (!next) {
+    return undefined;
+  }
+  try {
+    const query = new URL(next).searchParams;
+    query.delete('access_token');
+    return query.toString();
+  } catch (err) {
+    return undefined;
+  }
+}
+
+/**
+ * The query of one leaderboard page: the cursor when there is one, else the
+ * first page of the range. `limit` always comes from the caller.
+ */
+export function graphPagingQuery(
+  firstPage: string,
+  limit: number,
+  cursor?: string
+): string {
+  const query = new URLSearchParams(cursor || firstPage);
+  query.set('limit', String(limit));
+  query.delete('access_token');
+  return query.toString();
+}

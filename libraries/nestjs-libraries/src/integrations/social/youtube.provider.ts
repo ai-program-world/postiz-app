@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   AnalyticsPostItem,
+  AnalyticsPostsPage,
   AnalyticsSnapshotData,
   AuthTokenDetails,
   PendingCheckResponse,
@@ -39,6 +40,9 @@ import { setHeartbeatDetails } from '@gitroom/nestjs-libraries/temporal/temporal
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
 import { DashboardFunction } from '@gitroom/nestjs-libraries/integrations/dashboard.function.decorator';
 import { Tool } from '@gitroom/nestjs-libraries/integrations/tool.decorator';
+
+// Videos in the first page of the analytics leaderboard, the rest load on demand
+const YOUTUBE_POSTS_PAGE_SIZE = 10;
 
 const clientAndYoutube = () => {
   const client = new google.auth.OAuth2({
@@ -1235,7 +1239,7 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         trafficRows,
         countryRows,
         demoRows,
-        topVideoRows,
+        topVideos,
         contentTypeRows,
         subscribedStatusRows,
         deviceRows,
@@ -1326,25 +1330,9 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         ),
         safeAnalyticsCall(
           'youtube.topVideos',
-          async () => {
-            try {
-              const { data } = await ytAnalyticsClient.reports.query({
-                ids: 'channel==MINE',
-                startDate,
-                endDate,
-                metrics:
-                  'views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,likes,comments,shares',
-                dimensions: 'video',
-                sort: '-views',
-                maxResults: 10,
-              });
-              return this.mapYoutubeRows(data);
-            } catch (err) {
-              this.rethrowYoutubeAuthError(err);
-              throw err;
-            }
-          },
-          []
+          () =>
+            this.analyticsPosts(id, accessToken, date, YOUTUBE_POSTS_PAGE_SIZE),
+          { posts: [] as AnalyticsPostItem[] }
         ),
         safeAnalyticsCall(
           'youtube.contentType',
@@ -1653,76 +1641,19 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         'traffic'
       );
 
-      if (topVideoRows.length > 0) {
-        const videoIds = topVideoRows
-          .map((r) => String(r.video || ''))
-          .filter(Boolean);
-        const videoMetaMap = new Map<string, any>();
-
-        if (videoIds.length > 0) {
-          await safeAnalyticsCall(
-            'youtube.videos.list.meta',
-            async () => {
-              const metaRes = await ytDataClient.videos.list({
-                part: ['snippet', 'statistics'],
-                id: videoIds,
-              });
-              for (const item of metaRes.data.items || []) {
-                if (item.id) {
-                  videoMetaMap.set(item.id, item);
-                }
-              }
-            },
-            undefined
-          );
-        }
-
-        const posts: AnalyticsPostItem[] = topVideoRows.map((r) => {
-          const vid = String(r.video || '');
-          const meta = videoMetaMap.get(vid);
-          const snippet = meta?.snippet;
-          const views = Number(r.views) || 0;
-          const likes = Number(r.likes) || 0;
-          const comments = Number(r.comments) || 0;
-          const shares = Number(r.shares) || 0;
-          const er =
-            views > 0
-              ? Number((((likes + comments + shares) / views) * 100).toFixed(2))
-              : 0;
-          const thumb =
-            snippet?.thumbnails?.medium?.url ||
-            snippet?.thumbnails?.default?.url ||
-            undefined;
-
-          return {
-            id: vid,
-            title: summarizePostTitle(snippet?.title, `Video ${vid}`),
-            url: vid ? `https://www.youtube.com/watch?v=${vid}` : undefined,
-            thumbnail: thumb,
-            publishedAt: snippet?.publishedAt || endDate,
-            mediaType: 'VIDEO',
-            views,
-            likes,
-            comments,
-            shares,
-            engagementRate: er,
-            avgWatchTimeSeconds:
-              r.averageViewDuration !== undefined
-                ? Number(Number(r.averageViewDuration).toFixed(1))
-                : undefined,
-          };
+      if (topVideos.posts.length > 0) {
+        const topTotalViews = topVideos.posts.reduce(
+          (s, p) => s + (p.views || 0),
+          0
+        );
+        acc.push({
+          label: 'Top Videos Performance',
+          percentageChange: 0,
+          category: 'posts',
+          posts: topVideos.posts,
+          postsNextCursor: topVideos.nextCursor,
+          data: [{ total: String(topTotalViews), date: endDate }],
         });
-
-        if (posts.length > 0) {
-          const topTotalViews = posts.reduce((s, p) => s + (p.views || 0), 0);
-          acc.push({
-            label: 'Top Videos Performance',
-            percentageChange: 0,
-            category: 'posts',
-            posts,
-            data: [{ total: String(topTotalViews), date: endDate }],
-          });
-        }
       }
 
       return acc;
@@ -1731,6 +1662,113 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       console.error('Error fetching YouTube analytics:', err?.message || err);
       return [];
     }
+  }
+
+  // One page of the top videos of the selected range, by views
+  async analyticsPosts(
+    id: string,
+    accessToken: string,
+    date: number,
+    limit: number,
+    cursor?: string
+  ): Promise<AnalyticsPostsPage> {
+    const safeDays = Math.max(1, Math.min(365, Math.floor(date || 7)));
+    const endDate = dayjs().format('YYYY-MM-DD');
+    const startDate = dayjs().subtract(safeDays, 'day').format('YYYY-MM-DD');
+    // videos.list takes at most 50 ids
+    const pageSize = Math.min(limit, 50);
+    // the cursor is the 1-based startIndex of the next report rows
+    const startIndex = Math.max(1, Number(cursor) || 1);
+
+    const { client, youtube, youtubeAnalytics } = clientAndYoutube();
+    client.setCredentials({ access_token: accessToken });
+    const ytDataClient = youtube(client);
+
+    let topVideoRows: Record<string, any>[] = [];
+    try {
+      const { data } = await youtubeAnalytics(client).reports.query({
+        ids: 'channel==MINE',
+        startDate,
+        endDate,
+        metrics:
+          'views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,likes,comments,shares',
+        dimensions: 'video',
+        sort: '-views',
+        maxResults: pageSize,
+        startIndex,
+      });
+      topVideoRows = this.mapYoutubeRows(data);
+    } catch (err) {
+      this.rethrowYoutubeAuthError(err);
+      throw err;
+    }
+
+    const videoIds = topVideoRows
+      .map((r) => String(r.video || ''))
+      .filter(Boolean);
+    const videoMetaMap = new Map<string, any>();
+
+    if (videoIds.length > 0) {
+      await safeAnalyticsCall(
+        'youtube.videos.list.meta',
+        async () => {
+          const metaRes = await ytDataClient.videos.list({
+            part: ['snippet', 'statistics'],
+            id: videoIds,
+          });
+          for (const item of metaRes.data.items || []) {
+            if (item.id) {
+              videoMetaMap.set(item.id, item);
+            }
+          }
+        },
+        undefined
+      );
+    }
+
+    const posts: AnalyticsPostItem[] = topVideoRows.map((r) => {
+      const vid = String(r.video || '');
+      const meta = videoMetaMap.get(vid);
+      const snippet = meta?.snippet;
+      const views = Number(r.views) || 0;
+      const likes = Number(r.likes) || 0;
+      const comments = Number(r.comments) || 0;
+      const shares = Number(r.shares) || 0;
+      const er =
+        views > 0
+          ? Number((((likes + comments + shares) / views) * 100).toFixed(2))
+          : 0;
+      const thumb =
+        snippet?.thumbnails?.medium?.url ||
+        snippet?.thumbnails?.default?.url ||
+        undefined;
+
+      return {
+        id: vid,
+        title: summarizePostTitle(snippet?.title, `Video ${vid}`),
+        url: vid ? `https://www.youtube.com/watch?v=${vid}` : undefined,
+        thumbnail: thumb,
+        publishedAt: snippet?.publishedAt || endDate,
+        mediaType: 'VIDEO',
+        views,
+        likes,
+        comments,
+        shares,
+        engagementRate: er,
+        avgWatchTimeSeconds:
+          r.averageViewDuration !== undefined
+            ? Number(Number(r.averageViewDuration).toFixed(1))
+            : undefined,
+      };
+    });
+
+    return {
+      posts,
+      nextCursor:
+        topVideoRows.length === pageSize
+          ? String(startIndex + pageSize)
+          : undefined,
+    };
   }
 
   async analyticsSnapshot(
