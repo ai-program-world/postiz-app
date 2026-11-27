@@ -290,6 +290,23 @@ export class InstagramStandaloneProvider
     );
   }
 
+  async analyticsPosts(
+    id: string,
+    accessToken: string,
+    date: number,
+    limit: number,
+    cursor?: string
+  ) {
+    return instagramProvider.analyticsPosts(
+      id,
+      accessToken,
+      date,
+      limit,
+      cursor,
+      'graph.instagram.com'
+    );
+  }
+
   async postAnalytics(
     integrationId: string,
     accessToken: string,

@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   AnalyticsPostItem,
+  AnalyticsPostsPage,
   AnalyticsSnapshotData,
   AuthTokenDetails,
   PendingCheckResponse,
@@ -12,6 +13,7 @@ import {
 import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id';
 import { timer } from '@gitroom/helpers/utils/timer';
 import dayjs from 'dayjs';
+import { chunk } from 'lodash';
 import {
   BadBody,
   Disconnect,
@@ -24,6 +26,8 @@ import {
   buildBreakdown,
   computePercentageChange,
   computeSeriesTrend,
+  graphPagingCursor,
+  graphPagingQuery,
   mergeDailyPoints,
   previousDateWindows,
   safeAnalyticsCall,
@@ -37,6 +41,9 @@ import { META_GRAPH_API_VERSION } from '@gitroom/nestjs-libraries/integrations/s
 import { Tool } from '@gitroom/nestjs-libraries/integrations/tool.decorator';
 import { DashboardFunction } from '@gitroom/nestjs-libraries/integrations/dashboard.function.decorator';
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
+
+// Media in the first page of the analytics leaderboard, the rest load on demand
+const IG_POSTS_PAGE_SIZE = 12;
 
 @Rules(
   [
@@ -1810,16 +1817,77 @@ export class InstagramProvider
       });
     }
 
-    // 6. Recent Posts Performance Leaderboard
-    const recentPosts = await safeAnalyticsCall<AnalyticsPostItem[]>(
+    // 6. Recent Posts Performance Leaderboard, the next pages are loaded on demand
+    const recentPosts = await safeAnalyticsCall(
       'ig.recent_posts',
-      async () => {
-        const mediaRes = await this.fetchIgJson(
-          `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?fields=id,caption,media_type,media_product_type,permalink,thumbnail_url,media_url,timestamp,like_count,comments_count&limit=12&access_token=${accessToken}`
-        );
-        const items: any[] = mediaRes?.data || [];
-        const enriched = await Promise.all(
-          items.map(async (m) => {
+      () =>
+        this.analyticsPosts(
+          id,
+          token,
+          date,
+          IG_POSTS_PAGE_SIZE,
+          undefined,
+          type
+        ),
+      { posts: [] as AnalyticsPostItem[] }
+    );
+
+    if (recentPosts.posts.length > 0) {
+      analytics.push({
+        label: 'Recent Posts Performance',
+        percentageChange: 0,
+        category: 'posts',
+        posts: recentPosts.posts,
+        postsNextCursor: recentPosts.nextCursor,
+        data: [{ total: String(recentPosts.posts.length), date: today }],
+      });
+    }
+
+    return analytics;
+  }
+
+  // One page of the media published in the selected range
+  async analyticsPosts(
+    id: string,
+    token: string,
+    date: number,
+    limit: number,
+    cursor?: string,
+    type = 'graph.facebook.com'
+  ): Promise<AnalyticsPostsPage> {
+    const [accessToken] = token.split('___');
+    const today = dayjs().format('YYYY-MM-DD');
+    const windows = splitDateWindows(date, 28);
+    const since = windows[0].since;
+    const until = windows[windows.length - 1].until;
+    const mediaFields =
+      'id,caption,media_type,media_product_type,permalink,thumbnail_url,media_url,timestamp,like_count,comments_count';
+
+    const mediaRes = await this.fetchIgJson(
+      `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?${graphPagingQuery(
+        `fields=${mediaFields}&since=${since}&until=${until}`,
+        limit,
+        cursor
+      )}&access_token=${accessToken}`
+    );
+    let items: any[] = mediaRes?.data || [];
+    let nextCursor = graphPagingCursor(mediaRes?.paging?.next);
+
+    // A quiet range still shows the latest media, like before
+    if (!cursor && items.length === 0) {
+      const latestRes = await this.fetchIgJson(
+        `https://${type}/${META_GRAPH_API_VERSION}/${id}/media?fields=${mediaFields}&limit=${limit}&access_token=${accessToken}`
+      );
+      items = latestRes?.data || [];
+      nextCursor = undefined;
+    }
+
+    const posts: AnalyticsPostItem[] = [];
+    // a few media at a time, so a big page doesn't burst hundreds of calls
+    for (const batch of chunk(items, 10)) {
+      posts.push(
+        ...(await Promise.all(
+          batch.map(async (m) => {
             const [ins, reelIns] = await Promise.all([
               safeAnalyticsCall(
                 `ig.media_insight.${m.id}`,
@@ -1857,9 +1925,14 @@ export class InstagramProvider
               likes + comments + (shares || 0) + (saves || 0);
             return {
               id: String(m.id),
-              title: summarizePostTitle(m.caption, m.media_product_type || m.media_type || 'Post'),
+              title: summarizePostTitle(
+                m.caption,
+                m.media_product_type || m.media_type || 'Post'
+              ),
               url: m.permalink,
-              thumbnail: m.thumbnail_url || (m.media_type === 'IMAGE' ? m.media_url : undefined),
+              thumbnail:
+                m.thumbnail_url ||
+                (m.media_type === 'IMAGE' ? m.media_url : undefined),
               publishedAt: m.timestamp
                 ? dayjs(m.timestamp).format('YYYY-MM-DD HH:mm')
                 : today,
@@ -1880,23 +1953,11 @@ export class InstagramProvider
                   : undefined,
             } as AnalyticsPostItem;
           })
-        );
-        return enriched;
-      },
-      []
-    );
-
-    if (recentPosts.length > 0) {
-      analytics.push({
-        label: 'Recent Posts Performance',
-        percentageChange: 0,
-        category: 'posts',
-        posts: recentPosts,
-        data: [{ total: String(recentPosts.length), date: today }],
-      });
+        ))
+      );
     }
 
-    return analytics;
+    return { posts, nextCursor };
   }
 
   music(accessToken: string, data: { q: string }) {

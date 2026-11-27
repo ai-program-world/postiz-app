@@ -8,6 +8,8 @@ import {
   buildBreakdown,
   computePercentageChange,
   computeSeriesTrend,
+  graphPagingCursor,
+  graphPagingQuery,
   mergeDailyPoints,
   previousDateWindows,
   safeAnalyticsCall,
@@ -135,5 +137,28 @@ describe('analytics.helper', () => {
     expect(summarizePostTitle('  Hello\n\nWorld  ')).toBe('Hello World');
     expect(summarizePostTitle('', 'Fallback')).toBe('Fallback');
     expect(summarizePostTitle('一二三四五六', 'Fallback', 4)).toBe('一二三四…');
+  });
+
+  it('keeps the access token out of Graph paging cursors', () => {
+    expect(
+      graphPagingCursor(
+        'https://graph.facebook.com/v25.0/1/media?fields=id&limit=12&access_token=secret&after=abc'
+      )
+    ).toBe('fields=id&limit=12&after=abc');
+    expect(graphPagingCursor(undefined)).toBeUndefined();
+    expect(graphPagingCursor('not a url')).toBeUndefined();
+  });
+
+  it('builds the first page or the cursor page with the requested limit', () => {
+    expect(graphPagingQuery('fields=id&since=1&until=2', 12)).toBe(
+      'fields=id&since=1&until=2&limit=12'
+    );
+    expect(
+      graphPagingQuery(
+        'fields=id&since=1&until=2',
+        25,
+        'fields=id&limit=12&until=5&__paging_token=t&access_token=evil'
+      )
+    ).toBe('fields=id&limit=25&until=5&__paging_token=t');
   });
 });

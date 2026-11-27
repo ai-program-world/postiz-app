@@ -24,6 +24,8 @@ import {
   buildBreakdown,
   computePercentageChange,
   computeSeriesTrend,
+  graphPagingCursor,
+  graphPagingQuery,
   mergeDailyPoints,
   previousDateWindows,
   safeAnalyticsCall,
@@ -1664,18 +1666,15 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     const postFields =
       'id,message,permalink_url,full_picture,created_time,shares,attachments{media_type,target}';
 
-    // The cursor is the query of Graph's `paging.next` without the token, so
-    // both cursor based and time based (`until` + `__paging_token`) paging work
-    const query = new URLSearchParams(
-      cursor || `fields=${postFields}&since=${since}&until=${until}`
-    );
-    query.set('limit', String(limit));
-    query.delete('access_token');
     const feedRes = await this.fetchFbJson(
-      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?${query.toString()}&access_token=${accessToken}`
+      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/published_posts?${graphPagingQuery(
+        `fields=${postFields}&since=${since}&until=${until}`,
+        limit,
+        cursor
+      )}&access_token=${accessToken}`
     );
     let posts: any[] = feedRes?.data || [];
-    let nextCursor = this.analyticsPostsCursor(feedRes?.paging?.next);
+    let nextCursor = graphPagingCursor(feedRes?.paging?.next);
 
     // A quiet range still shows the latest posts, like before
     if (!cursor && posts.length === 0) {
@@ -1805,19 +1804,6 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
     }
 
     return { posts: items, nextCursor };
-  }
-
-  private analyticsPostsCursor(next?: string): string | undefined {
-    if (!next) {
-      return undefined;
-    }
-    try {
-      const query = new URL(next).searchParams;
-      query.delete('access_token');
-      return query.toString();
-    } catch (err) {
-      return undefined;
-    }
   }
 
   private sumInsightValue(value: any): number {

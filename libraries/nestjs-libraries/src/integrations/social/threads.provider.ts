@@ -1,6 +1,7 @@
 import {
   AnalyticsData,
   AnalyticsPostItem,
+  AnalyticsPostsPage,
   AnalyticsSnapshotData,
   AuthTokenDetails,
   PendingCheckResponse,
@@ -22,6 +23,8 @@ import {
   buildBreakdown,
   computePercentageChange,
   computeSeriesTrend,
+  graphPagingCursor,
+  graphPagingQuery,
   mergeDailyPoints,
   previousDateWindows,
   safeAnalyticsCall,
@@ -35,6 +38,9 @@ import { stripHtmlValidation } from '@gitroom/helpers/utils/strip.html.validatio
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
 import { ThreadsDto } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/threads.dto';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
+
+// Threads in the first page of the analytics leaderboard, the rest load on demand
+const THREADS_POSTS_PAGE_SIZE = 12;
 
 @Rules(
   'If the content of the post (text, pictures or video) was made with AI, ask the user if they want to mark it as AI, and set made_with_ai to true only when they say yes.'
@@ -1092,16 +1098,67 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
     addDemoCard('Audience by Age', ageMap, 10);
     addDemoCard('Audience by Gender', genderMap, 6);
 
-    // 4. Recent Threads Leaderboard
-    const recentThreads = await safeAnalyticsCall<AnalyticsPostItem[]>(
+    // 4. Recent Threads Leaderboard, the next pages are loaded on demand
+    const recentThreads = await safeAnalyticsCall(
       'threads.recent_posts',
-      async () => {
-        const listRes = await this.fetchThreadsJson(
-          `https://graph.threads.net/v1.0/${id}/threads?fields=id,text,media_type,permalink,thumbnail_url,media_url,timestamp&limit=12&access_token=${accessToken}`
-        );
-        const items: any[] = listRes?.data || [];
-        return Promise.all(
-          items.map(async (item) => {
+      () => this.analyticsPosts(id, accessToken, date, THREADS_POSTS_PAGE_SIZE),
+      { posts: [] as AnalyticsPostItem[] }
+    );
+
+    if (recentThreads.posts.length > 0) {
+      result.push({
+        label: 'Recent Posts Performance',
+        percentageChange: 0,
+        category: 'posts',
+        posts: recentThreads.posts,
+        postsNextCursor: recentThreads.nextCursor,
+        data: [{ total: String(recentThreads.posts.length), date: today }],
+      });
+    }
+
+    return result;
+  }
+
+  // One page of the threads published in the selected range
+  async analyticsPosts(
+    id: string,
+    accessToken: string,
+    date: number,
+    limit: number,
+    cursor?: string
+  ): Promise<AnalyticsPostsPage> {
+    const today = dayjs().format('YYYY-MM-DD');
+    const windows = splitDateWindows(date, 28);
+    const since = windows[0].since;
+    const until = windows[windows.length - 1].until;
+    const threadFields =
+      'id,text,media_type,permalink,thumbnail_url,media_url,timestamp';
+
+    const listRes = await this.fetchThreadsJson(
+      `https://graph.threads.net/v1.0/${id}/threads?${graphPagingQuery(
+        `fields=${threadFields}&since=${since}&until=${until}`,
+        limit,
+        cursor
+      )}&access_token=${accessToken}`
+    );
+    let items: any[] = listRes?.data || [];
+    let nextCursor = graphPagingCursor(listRes?.paging?.next);
+
+    // A quiet range still shows the latest threads, like before
+    if (!cursor && items.length === 0) {
+      const latestRes = await this.fetchThreadsJson(
+        `https://graph.threads.net/v1.0/${id}/threads?fields=${threadFields}&limit=${limit}&access_token=${accessToken}`
+      );
+      items = latestRes?.data || [];
+      nextCursor = undefined;
+    }
+
+    const posts: AnalyticsPostItem[] = [];
+    // a few threads at a time, so a big page doesn't burst hundreds of calls
+    for (const batch of chunk(items, 10)) {
+      posts.push(
+        ...(await Promise.all(
+          batch.map(async (item) => {
             const ins = await safeAnalyticsCall(
               `threads.post_insight.${item.id}`,
               () =>
@@ -1141,22 +1198,11 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
                   : undefined,
             } as AnalyticsPostItem;
           })
-        );
-      },
-      []
-    );
-
-    if (recentThreads.length > 0) {
-      result.push({
-        label: 'Recent Posts Performance',
-        percentageChange: 0,
-        category: 'posts',
-        posts: recentThreads,
-        data: [{ total: String(recentThreads.length), date: today }],
-      });
+        ))
+      );
     }
 
-    return result;
+    return { posts, nextCursor };
   }
 
   @Plug({
